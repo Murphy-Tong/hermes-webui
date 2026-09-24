@@ -2298,6 +2298,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _writeAssistantMarkdown(content, final=false){
     if(!_isActiveSession()||!assistantBody||!assistantBody.isConnected) return;
+    if(S.activeStreamId&&S.activeStreamId!==streamId) return;
+    const turn=assistantBody.closest('.assistant-turn');
+    if(turn){
+      turn.dataset.anchorStreamId=streamId;
+      turn.dataset.sessionId=activeSid;
+      turn.dataset.profileId=_streamProfile||'';
+    }
     mountHermesMarkdown(assistantBody,content,{
       key:`live-prose:${streamId}:${_assistantSegmentSeq}`,
       sessionId:activeSid,profileId:_streamProfile,final,

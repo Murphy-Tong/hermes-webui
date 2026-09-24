@@ -75,17 +75,6 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" integrity="sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh" crossorigin="anonymous">
   <!-- KaTeX math rendering CSS (loaded eagerly from vendored assets to prevent font CSP noise) -->
   <link rel="stylesheet" href="static/vendor/katex/0.16.22/katex.min.css">
-  <!-- streaming-markdown: incremental DOM-building markdown parser for live streams -->
-  <!-- Self-hosted from npm:streaming-markdown@0.2.15 — no CDN dependency.           -->
-  <!-- sha384 of smd.min.js @0.2.15: sha384-T6r95ocN9t3W8tUK2Fa6FPaO7bJryyjyW0WCalrUnpgtm2qXr5xcN4vwPYEJ6vHa -->
-  <!-- ES module imports do not support the integrity= attribute (W3C limitation);    -->
-  <!-- version is pinned in the vendored file path; hash documented above for audit. -->
-  <script type="module">
-    import * as smd from './static/vendor/smd.min.js';
-    // SRI verification happens at the ES module level via importmap or SW; pinning version in URL.
-    // sha384 of smd.min.js @0.2.15: sha384-T6r95ocN9t3W8tUK2Fa6FPaO7bJryyjyW0WCalrUnpgtm2qXr5xcN4vwPYEJ6vHa
-    window.smd = smd;
-  </script>
   <!-- Prism.js syntax highlighting (loaded async, non-blocking) -->
   <!-- SRI removed from prism-tomorrow.min.css — jsdelivr serves different digests across
        edge nodes causing intermittent integrity failures that block syntax highlighting (#1100).

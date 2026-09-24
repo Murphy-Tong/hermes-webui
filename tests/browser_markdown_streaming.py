@@ -109,6 +109,7 @@ def main():
                                 page.mouse.wheel(0, -550)
                                 page.wait_for_timeout(300)
                                 before = page.evaluate(CAPTURE)
+                                page.evaluate("() => { fixtureDetails=document.querySelector('#liveAssistantTurn [data-anchor-scene-row] details')||document.querySelector('#liveAssistantTurn details'); fixtureDetails.open=true; }")
                                 assert before['scrollTop'] > 0 and not before['pinned'], before
                                 page.evaluate("""() => {
                                   for(let i=0;i<20;i++) fixtureSource.emit('token', {text:'新增流式内容 '+i+'。\\n\\n'}, 'markdown-run:'+(i+3));
@@ -121,6 +122,15 @@ def main():
                                 result = dict(engine=engine, width=width, mode=mode, before=before,
                                               appended=appended, redrawn=redrawn,
                                               html=page.locator('#liveAssistantTurn details').count(), errors=errors)
+                                final_text = '## 流式正文\n\n<details><summary>展开</summary>交互内容</details>\n\n' + ''.join(f'新增流式内容 {i}。\n\n' for i in range(20))
+                                completed = dict(session, active_stream_id=None, pending_user_message=None,
+                                                 messages=messages + [dict(role='user', content='继续流式输出', timestamp=100),
+                                                                      dict(role='assistant', content=final_text, timestamp=101)],
+                                                 message_count=len(messages) + 2)
+                                page.evaluate("session => fixtureSource.emit('done', {session,status:'completed'}, 'markdown-run:23')", completed)
+                                page.wait_for_timeout(500)
+                                result['settled'] = page.evaluate("() => ({sameNode:fixtureDetails.isConnected, open:fixtureDetails.open, liveTurns:document.querySelectorAll('#liveAssistantTurn').length})")
+                                result['settledScroll'] = page.evaluate(MEASURE)
                                 results.append(result)
                                 print(json.dumps(result, ensure_ascii=False), flush=True)
                                 if not baseline:
@@ -129,6 +139,9 @@ def main():
                                         assert measured['delta'] is not None and abs(measured['delta']) <= 2, result
                                         assert not measured['pinned'], result
                                     assert result['html'] > 0, result
+                                    assert result['settled']['sameNode'] and result['settled']['open'], result
+                                    assert result['settled']['liveTurns'] == 0, result
+                                    assert abs(result['settledScroll']['delta']) <= 2 and not result['settledScroll']['pinned'], result
                                     assert not errors, errors
                                 screenshots = os.environ.get('SCREENSHOT_DIR')
                                 if screenshots:
