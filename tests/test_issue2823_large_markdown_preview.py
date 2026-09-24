@@ -46,7 +46,7 @@ def test_large_markdown_force_render_affordance_exists():
     assert "openFile(_previewCurrentPath,{forceRichMarkdown:true})" in WORKSPACE_JS
 
 
-def test_markdown_render_helper_runs_render_md_and_katex():
+def test_markdown_render_helper_uses_shared_component():
     marker = "function renderMarkdownPreviewContent(data){"
     start = WORKSPACE_JS.find(marker)
     assert start != -1, "renderMarkdownPreviewContent() helper not found"
@@ -55,13 +55,13 @@ def test_markdown_render_helper_runs_render_md_and_katex():
     helper = WORKSPACE_JS[start:end]
 
     target_pos = helper.find("const target=data&&data.el?data.el:$('previewMd')")
-    render_pos = helper.find("target.innerHTML=renderMd(data.content)")
-    katex_pos = helper.rfind("renderKatexBlocks")
+    render_pos = helper.find("mountHermesMarkdown(target,data?.content||''")
     assert target_pos != -1, "Helper must honor an explicit markdown render target"
     assert "if(!data||!data.el) showPreview('md')" in helper
-    assert render_pos != -1, "Helper must rich-render markdown"
-    assert katex_pos != -1, "Helper must preserve KaTeX enhancement"
-    assert target_pos < render_pos < katex_pos
+    assert render_pos > target_pos, "正文由共享组件负责渲染"
+    assert "renderKatexBlocks" not in helper, "外壳不得二次改写组件拥有的公式节点"
+    # 公式及真实组件的行为覆盖见 frontend/renderer/renderer.test.ts 与 surfaces.test.ts。
+    assert "surface:'preview'" in helper
 
 
 def test_large_markdown_fallback_sets_raw_content_before_size_gate():

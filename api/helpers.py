@@ -92,7 +92,7 @@ _CSP_SHARED_POLICY_TEMPLATE = (
     "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
     "img-src 'self' data: https: blob:; "
     "font-src 'self' data: https://fonts.gstatic.com; "
-    "media-src 'self' data: blob:; "
+    "media-src 'self' data: blob: https:; "
     "connect-src {connect_src}; "
     "frame-src {frame_src}; "
     "manifest-src 'self' https://*.cloudflareaccess.com; "
@@ -152,6 +152,31 @@ def _csp_extra_frame_src() -> str:
         logger.warning("Ignoring invalid HERMES_WEBUI_CSP_FRAME_EXTRA value")
         return ""
     return " " + " ".join(sources)
+
+
+def _markdown_iframe_origins() -> list[str]:
+    """Markdown 仅获得显式 HTTPS origin；最终同源/地址检查仍在使用点执行。"""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    origins = []
+    for source in _csp_extra_frame_src().split():
+        if not source.startswith("https://") or "*" in source:
+            continue
+        parsed = urlsplit(source)
+        host = (parsed.hostname or "").lower()
+        if "." not in host or host.endswith((".localhost", ".local", ".internal")):
+            continue
+        try:
+            if not ipaddress.ip_address(host).is_global:
+                continue
+        except ValueError:
+            pass
+        port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
+        origin = f"https://{host}{port}"
+        if origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 def _csp_connect_src(extra_connect_src: str = "") -> str:

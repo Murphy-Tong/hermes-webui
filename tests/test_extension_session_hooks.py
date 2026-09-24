@@ -39,18 +39,19 @@ class El {
   constructor(n){this.children=[];this.attrs={};this.dataset={};
     this._html='';this._text='';this.tagName=n;}
   set className(v){this._cls=v;} get className(){return this._cls;}
-  set innerHTML(v){this._html=v;} get innerHTML(){return this._html;}
-  set textContent(v){this._text=v;} get textContent(){return this._text;}
+  set innerHTML(v){this.children=[];this._text='';this._html=v;}
+  get innerHTML(){return this.children.length ? this.children.map(c=>c.outerHTML).join('') : this._html;}
+  set textContent(v){this.children=[];this._text=String(v);
+    this._html=this._text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  get textContent(){return this.children.length ? this.children.map(c=>c.textContent).join('') : this._text;}
+  get outerHTML(){
+    let a=this._cls ? ` class="${this._cls}"` : '';
+    if(this.attrs['data-role'])a+=` data-role="${this.attrs['data-role']}"`;
+    return `<${this.tagName}${a}>${this.innerHTML}</${this.tagName}>`;
+  }
   setAttribute(k,v){this.attrs[k]=v;
     if(k==='data-role')this.dataset.role=v;}
-  appendChild(c){this.children.push(c);
-    this._html = this.children.map(child => {
-      let a = '';
-      if (child._cls) a += ` class="${child._cls}"`;
-      if (child.attrs['data-role']) a += ` data-role="${child.attrs['data-role']}"`;
-      return `<${child.tagName}${a}>${child._html}</${child.tagName}>`;
-    }).join('');
-    return c;}
+  appendChild(c){this.children.push(c);return c;}
 }
 global.document={createElement:(n)=>new El(n)};
 """
@@ -114,7 +115,7 @@ class TestRenderTranscript:
         body = (
             DOM_SHIM
             + _fn_body(BOOT_JS, "renderTranscript", "renderTranscript")
-            + "global.window = {renderMd: (s)=>'<p>'+s+'</p>'};\n"
+            + "function mountHermesMarkdown(el, content){el.textContent=content;}\n"
             + textwrap.dedent("""
                 var c = document.createElement('div');
                 renderTranscript(c, [
@@ -134,7 +135,7 @@ class TestRenderTranscript:
         body = (
             DOM_SHIM
             + _fn_body(BOOT_JS, "renderTranscript", "renderTranscript")
-            + "global.window = {renderMd: (s)=>'<p>'+s+'</p>'};\n"
+            + "function mountHermesMarkdown(el, content){el.textContent=content;}\n"
             + textwrap.dedent("""
                 var c = document.createElement('div');
                 renderTranscript(c, [{"role":"user","content":[
@@ -152,7 +153,7 @@ class TestRenderTranscript:
         body = (
             DOM_SHIM
             + _fn_body(BOOT_JS, "renderTranscript", "renderTranscript")
-            + "global.window = {renderMd: (s)=>'<p>'+s+'</p>'};\n"
+            + "function mountHermesMarkdown(el, content){el.textContent=content;}\n"
             + textwrap.dedent("""
                 var c = document.createElement('div');
                 renderTranscript(c, [
@@ -169,7 +170,7 @@ class TestRenderTranscript:
         body = (
             DOM_SHIM
             + _fn_body(BOOT_JS, "renderTranscript", "renderTranscript")
-            + "global.window = {renderMd: (s)=>'<p>'+s+'</p>'};\n"
+            + "function mountHermesMarkdown(el, content){el.textContent=content;}\n"
             + textwrap.dedent("""
                 var c = document.createElement('div');
                 renderTranscript(c, [{"role":"user","content":"x"}], {});
@@ -180,13 +181,12 @@ class TestRenderTranscript:
         assert 'class="msg-body"' in out
         assert "msg-body-inner" not in out
 
-    def test_fallback_textcontent_when_renderMd_missing(self, tmp_path):
+    def test_fallback_textcontent_when_renderer_missing(self, tmp_path):
         body = (
             DOM_SHIM
             + _fn_body(BOOT_JS, "renderTranscript", "renderTranscript")
             + textwrap.dedent("""
                 var c = document.createElement('div');
-                delete window.renderMd;
                 renderTranscript(c, [{
                   "role":"user",
                   "content":"<script>x</script>"
@@ -196,6 +196,7 @@ class TestRenderTranscript:
         )
         out = _run_in_tmp(tmp_path, body)
         assert "<script>x</script>" not in out
+        assert "&lt;script&gt;x&lt;/script&gt;" in out
 
 
 # ── boot.js: hook registration ───────────────────────────────────────────────

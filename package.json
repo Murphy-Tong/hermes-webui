@@ -2,11 +2,32 @@
   "name": "hermes-webui-devtools",
   "version": "1.0.0",
   "private": true,
-  "description": "Dev-only tooling for hermes-webui. NOT a build step — the app remains pure Python + vanilla JS with no bundler. The only dependency is ESLint, used solely as a runtime-error guard over static/*.js (catches brick-class bugs like #3162 const-reassignment that node --check and source-presence tests miss). See TESTING.md > 'Static JS runtime lint'.",
+  "description": "Hermes WebUI 开发工具与局部 Markdown 渲染器构建；Python 运行时使用已提交的静态产物。",
   "scripts": {
-    "lint:runtime": "eslint --no-config-lookup -c eslint.runtime-guard.config.mjs \"static/**/*.js\""
+    "lint:runtime": "eslint --no-config-lookup -c eslint.runtime-guard.config.mjs \"static/**/*.js\"",
+    "build:renderer": "vite build --config frontend/renderer/vite.config.ts",
+    "check:renderer": "tsc --noEmit -p frontend/renderer/tsconfig.json",
+    "test:renderer": "vitest run --config frontend/renderer/vite.config.ts",
+    "test:renderer:built": "vitest run --config frontend/renderer/vite.config.ts --mode built"
+  },
+  "engines": { "node": ">=20.19.0" },
+  "dependencies": {
+    "dompurify": "3.4.16",
+    "katex": "0.16.47",
+    "markstream-vue": "2.0.13",
+    "mermaid": "11.17.2",
+    "prismjs": "1.30.0",
+    "stream-markdown-parser": "1.2.16",
+    "vue": "3.5.43",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
-    "eslint": "^10.4.0"
+    "@types/node": "22.19.15",
+    "@types/prismjs": "1.26.6",
+    "eslint": "^10.4.0",
+    "jsdom": "26.1.0",
+    "typescript": "5.9.3",
+    "vite": "6.4.3",
+    "vitest": "3.2.7"
   }
 }

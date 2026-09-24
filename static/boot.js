@@ -1492,8 +1492,8 @@ window._hermesNotifySessionOpen=function(sid, data, opts){
 window.renderTranscript=function(container, messages, opts){
   if(!container||!Array.isArray(messages)) return container;
   opts=opts||{};
+  window.HermesMarkdown?.destroyWithin(container);
   container.innerHTML='';
-  var md=window.renderMd||null;
   for(var i=0;i<messages.length;i++){
     var msg=messages[i];
     if(!msg||!msg.role||msg.role==='tool') continue;
@@ -1514,19 +1514,16 @@ window.renderTranscript=function(container, messages, opts){
     row.setAttribute('data-role',msg.role);
     var body=document.createElement('div');
     body.className='msg-body';
-    try{
-      if(md){
-        var html=md(content);
-        if(html!=null){body.innerHTML=html}else{body.textContent=content}
-      }else{
-        body.textContent=content;
-      }
-    }catch(_){body.textContent=content}
     row.appendChild(body);
     container.appendChild(row);
-  }
-  if(typeof _rehydrateTransparentStreamDom==='function'){
-    try{_rehydrateTransparentStreamDom(container);}catch(_){}
+    try{
+      if(typeof mountHermesMarkdown==='function'){
+        mountHermesMarkdown(body,content,{
+          key:'transcript:'+(msg.message_id||msg.id||i),surface:'transcript',
+          sessionId:opts.sessionId,profileId:opts.profileId,snapshots:msg._media_snapshots||msg.media_snapshots,
+        });
+      }else body.textContent=content;
+    }catch(_){body.textContent=content}
   }
   return container;
 };
@@ -2217,6 +2214,8 @@ $('importFileInput').onchange=async(e)=>{
 };
 // btnRefreshFiles is now panel-icon-btn in header (see HTML)
 function clearPreview(opts={}){
+  _previewRequestGeneration++;
+  _previewContentOwner='';_previewRawContent='';_previewRawContentPath='';
   const keepPanelOpen=!!(opts&&opts.keepPanelOpen);
   // Restore directory breadcrumb after closing file preview
   if(typeof renderBreadcrumb==='function') renderBreadcrumb();
@@ -2225,7 +2224,7 @@ function clearPreview(opts={}){
   const pi=$('previewImg');if(pi){pi.onerror=null;pi.src='';}
   const pdf=$('previewPdfFrame');if(pdf)pdf.src='';
   const html=$('previewHtmlIframe');if(html)html.src='';
-  const pm=$('previewMd');if(pm)pm.innerHTML='';
+  const pm=$('previewMd');if(pm){window.HermesMarkdown?.destroyWithin(pm);pm.innerHTML='';}
   const pc=$('previewCode');if(pc)pc.textContent='';
   const pp=$('previewPathText');if(pp)pp.textContent='';
   const ft=$('fileTree');if(ft)ft.style.display='';

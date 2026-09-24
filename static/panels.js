@@ -4,6 +4,10 @@ let _kanbanBoard = null;
 let _kanbanLatestEventId = 0;
 let _kanbanPollTimer = null;
 let _kanbanCurrentTaskId = null;
+let _kanbanDetailGeneration = 0;
+function _kanbanDetailOwner(){
+  return JSON.stringify([S.activeProfile,S.session?.session_id,_kanbanCurrentBoard]);
+}
 let _kanbanLanesByProfile = true;
 // Multi-board state. _kanbanCurrentBoard is the slug of the active board
 // the UI is currently viewing. null means "use whatever the server reports
@@ -2282,188 +2286,31 @@ function _kanbanRenderSidebar(columns){
 }
 
 
-/**
- * Render inline markdown (bold, italic, code, links, strikethrough).
- * Input is already HTML-escaped.
- */
-function _kanbanRenderMarkdownInline(escaped){
-  return String(escaped || '')
-    .replace(/~~([^~\n]+)~~/g, (_m, text) => `<del>${text}</del>`)
-    .replace(/`([^`\n]+)`/g, (_m, code) => `<code>${code}</code>`)
-    .replace(/\*\*([^*\n]+)\*\*/g, (_m, text) => `<strong>${text}</strong>`)
-    .replace(/(^|[^*a-zA-Z0-9])\*([^*\n]+)\*/g, (_m, prefix, text) => `${prefix}<em>${text}</em>`)
-    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g, (_m, text, href) => `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`);
+// 外壳只生成容器；任务原文不进入 HTML 字符串，统一交给 Markdown 组件。
+function _kanbanMountCardMarkdown(board,columns){
+  const tasks=new Map(columns.flatMap(col=>(col.tasks||[]).map(task=>[String(task.id),task])));
+  board.querySelectorAll('.kanban-card').forEach(card=>{
+    const task=tasks.get(card.dataset.kanbanTaskId);
+    if(!task)return;
+    mountHermesMarkdown(card.querySelector('.kanban-card-body'),_kanbanTaskBody(task),{
+      key:JSON.stringify(['kanban',_kanbanCurrentBoard,task.id,'card']),surface:'preview',
+    });
+  });
 }
 
-/**
- * Render full markdown block content: headings, code blocks, lists, tables,
- * task lists, blockquotes, horizontal rules, paragraphs + inline formatting.
- */
-function _kanbanRenderMarkdown(source){
-  if (!source) return '';
-  const lines = esc(source).split(/\r?\n/);
-  const out = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // ── Code block ──
-    if (/^```/.test(trimmed)) {
-      const lang = trimmed.slice(3).trim();
-      const codeLines = [];
-      i++;
-      while (i < lines.length && !/^```/.test(lines[i].trim())) {
-        codeLines.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing ```
-      const codeHtml = codeLines.join('\n');
-      out.push(lang
-        ? `<pre class="hermes-kanban-code"><code class="language-${_kanbanRenderMarkdownInline(lang)}">${codeHtml}</code></pre>`
-        : `<pre class="hermes-kanban-code"><code>${codeHtml}</code></pre>`);
-      continue;
-    }
-
-    // ── Horizontal rule ──
-    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(trimmed)) {
-      out.push('<hr>');
-      i++;
-      continue;
-    }
-
-    // ── Heading ──
-    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      out.push(`<h${level}>${_kanbanRenderMarkdownInline(headingMatch[2])}</h${level}>`);
-      i++;
-      continue;
-    }
-
-    // ── Blockquote ──
-    if (/^>\s?/.test(trimmed)) {
-      const quoteLines = [];
-      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
-        quoteLines.push(lines[i].trim().replace(/^>\s?/, ''));
-        i++;
-      }
-      out.push(`<blockquote>${_kanbanRenderMarkdownInline(quoteLines.join('<br>'))}</blockquote>`);
-      continue;
-    }
-
-    // ── Table row ──
-    if (/^\|.+\|$/.test(trimmed)) {
-      const tableRows = [];
-      const tableAligns = [];
-      while (i < lines.length && /^\|.+\|$/.test(lines[i].trim())) {
-        const row = lines[i].trim();
-        // Detect alignment separator row
-        if (/^\|[\s:]*-{3,}[\s:]*\|/.test(row)) {
-          const cells = row.split('|').filter(c => c.trim().length > 0);
-          cells.forEach(c => {
-            const t = c.trim();
-            if (t.startsWith(':') && t.endsWith(':')) tableAligns.push('center');
-            else if (t.endsWith(':')) tableAligns.push('right');
-            else tableAligns.push('left');
-          });
-        } else {
-          const cells = row.split('|').filter(c => c.trim().length > 0);
-          tableRows.push(cells.map((c, ci) => {
-            const align = tableAligns[ci] ? ` style="text-align:${tableAligns[ci]}"` : '';
-            return `<td${align}>${_kanbanRenderMarkdownInline(c.trim())}</td>`;
-          }).join(''));
-        }
-        i++;
-      }
-      if (tableRows.length) {
-        out.push(`<table><tbody>${tableRows.map(r => `<tr>${r}</tr>`).join('')}</tbody></table>`);
-      }
-      continue;
-    }
-
-    // ── Task list item ──
-    const taskMatch = trimmed.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
-    if (taskMatch) {
-      const checked = taskMatch[1] !== ' ';
-      const text = taskMatch[2];
-      const items = [];
-      items.push(`<li class="hermes-kanban-task${checked ? ' checked' : ''}"><input type="checkbox"${checked ? ' checked' : ''} disabled> ${_kanbanRenderMarkdownInline(text)}</li>`);
-      i++;
-      // Collect continuation items
-      while (i < lines.length) {
-        const next = lines[i].trim();
-        const nextTask = next.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
-        const nextLi = next.match(/^[-*+]\s+(.+)$/);
-        if (nextTask) {
-          const c = nextTask[1] !== ' ';
-          items.push(`<li class="hermes-kanban-task${c ? ' checked' : ''}"><input type="checkbox"${c ? ' checked' : ''} disabled> ${_kanbanRenderMarkdownInline(nextTask[2])}</li>`);
-          i++;
-        } else if (nextLi) {
-          items.push(`<li>${_kanbanRenderMarkdownInline(nextLi[1])}</li>`);
-          i++;
-        } else {
-          break;
-        }
-      }
-      out.push(`<ul>${items.join('')}</ul>`);
-      continue;
-    }
-
-    // ── Unordered list item ──
-    const ulMatch = trimmed.match(/^[-*+]\s+(.+)$/);
-    if (ulMatch) {
-      const items = [];
-      items.push(`<li>${_kanbanRenderMarkdownInline(ulMatch[1])}</li>`);
-      i++;
-      while (i < lines.length) {
-        const next = lines[i].trim();
-        const nextUl = next.match(/^[-*+]\s+(.+)$/);
-        const nextTask = next.match(/^[-*+]\s+\[( |x|X)\]\s+(.+)$/);
-        if (nextTask) break; // let task list handler get it
-        if (nextUl) {
-          items.push(`<li>${_kanbanRenderMarkdownInline(nextUl[1])}</li>`);
-          i++;
-        } else {
-          break;
-        }
-      }
-      out.push(`<ul>${items.join('')}</ul>`);
-      continue;
-    }
-
-    // ── Ordered list item ──
-    const olMatch = trimmed.match(/^\d+\.\s+(.+)$/);
-    if (olMatch) {
-      const items = [];
-      items.push(`<li>${_kanbanRenderMarkdownInline(olMatch[1])}</li>`);
-      i++;
-      while (i < lines.length) {
-        const next = lines[i].trim();
-        const nextOl = next.match(/^\d+\.\s+(.+)$/);
-        if (nextOl) {
-          items.push(`<li>${_kanbanRenderMarkdownInline(nextOl[1])}</li>`);
-          i++;
-        } else {
-          break;
-        }
-      }
-      out.push(`<ol>${items.join('')}</ol>`);
-      continue;
-    }
-
-    // ── Empty line ──
-    if (!trimmed) {
-      out.push('');
-      i++;
-      continue;
-    }
-
-    // ── Paragraph ──
-    out.push(`<p>${_kanbanRenderMarkdownInline(trimmed)}</p>`);
-    i++;
-  }
-  return `<div class="hermes-kanban-md">${out.join('\n')}</div>`;
+function _kanbanMountDetailMarkdown(preview,data){
+  const task=data.task||{};
+  const key=JSON.stringify(['kanban',_kanbanCurrentBoard,task.id]);
+  mountHermesMarkdown(preview.querySelector('.kanban-task-preview-body'),_kanbanTaskBody(task)||t('kanban_no_description'),{
+    key:key+':body',surface:'preview',
+  });
+  preview.querySelectorAll('.kanban-detail-comments .kanban-detail-row-main').forEach((host,index)=>{
+    const comment=(data.comments||[])[index];
+    if(!comment)return;
+    mountHermesMarkdown(host,comment.body||comment.text||comment.content||'',{
+      key:JSON.stringify([key,'comment',comment.id??index]),surface:'preview',
+    });
+  });
 }
 
 function _kanbanFormatDuration(seconds){
@@ -2518,6 +2365,7 @@ function finishKanbanDrag(event){
 }
 
 function openKanbanCard(event, taskId){
+  if(event?.target?.closest?.('a,button,input,summary,video,audio,iframe'))return true;
   if (Date.now() < _kanbanSuppressCardClickUntil) {
     if (event) {
       event.preventDefault();
@@ -2618,6 +2466,7 @@ function clearKanbanFilters(){
 function _kanbanRenderBoard(){
   const board = $('kanbanBoard');
   if (!board) return;
+  window.HermesMarkdown?.destroyWithin(board);
   if (!_kanbanBoard || !_kanbanBoard.columns) {
     board.innerHTML = _kanbanEmptyBoardHtml();
     return;
@@ -2633,6 +2482,7 @@ function _kanbanRenderBoard(){
     return;
   }
   board.innerHTML = _kanbanLanesByProfile ? _kanbanRenderProfileLanes(columns) : columns.map(_kanbanRenderColumn).join('');
+  _kanbanMountCardMarkdown(board,columns);
 }
 
 function _kanbanCard(task, status){
@@ -2644,10 +2494,10 @@ function _kanbanCard(task, status){
   const stale = _kanbanCardStalenessClass(task);
   const body = _kanbanTaskBody(task);
   const assignee = task.assignee ? `<span class="kanban-card-assignee">@${esc(task.assignee)}</span>` : `<span class="kanban-card-unassigned">${esc(t('kanban_unassigned'))}</span>`;
-  return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, ${jsArg(task.id)})" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, ${jsArg(task.id)})" tabindex="0" role="button" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();loadKanbanTask(${jsArg(task.id)})}">
+  return `<article class="kanban-card ${esc(stale)}" data-kanban-task-id="${esc(task.id)}" draggable="true" ondragstart="dragKanbanTask(event, ${jsArg(task.id)})" ondragend="finishKanbanDrag(event)" onclick="return openKanbanCard(event, ${jsArg(task.id)})" tabindex="0" role="button" onkeydown="if(event.target===event.currentTarget&&(event.key==='Enter'||event.key===' ')){event.preventDefault();loadKanbanTask(${jsArg(task.id)})}">
     <div class="kanban-card-topline"><span class="kanban-card-id">${esc(task.id || '')}</span>${priority ? `<span class="kanban-badge priority">P${priority}</span>` : ''}${task.tenant ? `<span class="kanban-badge tenant">${esc(task.tenant)}</span>` : ''}</div>
     <div class="kanban-card-title">${esc(_kanbanTaskTitle(task))}</div>
-    ${body ? `<div class="kanban-card-body">${_kanbanRenderMarkdown(body)}</div>` : ''}
+    ${body ? '<div class="kanban-card-body hermes-kanban-md"></div>' : ''}
     <div class="kanban-card-meta">${assignee}${comments ? `<span class="kanban-card-metric">💬 ${comments}</span>` : ''}${linkTotal ? `<span class="kanban-card-metric">↔ ${linkTotal}</span>` : ''}${age ? `<span class="kanban-card-age">${esc(age)}</span>` : ''}</div>
     ${_kanbanCardQuickActions(task)}
   </article>`;
@@ -2765,7 +2615,10 @@ async function loadKanban(animate){
   const board = $('kanbanBoard');
   const list = $('kanbanList');
   try {
-    if (animate && board) board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
+    if (animate && board) {
+      window.HermesMarkdown?.destroyWithin(board);
+      board.innerHTML = `<div style="padding:16px;color:var(--muted);font-size:13px">${esc(t('loading'))}</div>`;
+    }
     // Resolve the active board before board-scoped requests. If another CLI or
     // tab archived the previous board, /boards can fall back to default instead
     // of leaving config/board pinned to a ghost slug.
@@ -2810,7 +2663,7 @@ async function loadKanban(animate){
     _kanbanRenderBoard();
   } catch(e) {
     const html = _kanbanUnavailableHtml(e);
-    if (board) board.innerHTML = html;
+    if (board) { window.HermesMarkdown?.destroyWithin(board); board.innerHTML = html; }
     if (list) list.innerHTML = html;
   }
 }
@@ -3066,9 +2919,11 @@ async function unblockKanbanTask(taskId){
 }
 
 function closeKanbanTaskDetail(){
+  _kanbanDetailGeneration++;
   _kanbanCurrentTaskId = null;
   const preview = $('kanbanTaskPreview');
   if (preview) {
+    window.HermesMarkdown?.destroyWithin(preview);
     preview.style.display = 'none';
     preview.innerHTML = '';
   }
@@ -3125,7 +2980,7 @@ function _kanbanCommentHtml(comment){
   const by = comment.author || comment.created_by || comment.actor || '';
   const at = _kanbanFormatTimestamp(comment.created_at || comment.ts || '');
   return `<div class="kanban-detail-row">
-    <div class="kanban-detail-row-main">${_kanbanRenderMarkdown(body)}</div>
+    <div class="kanban-detail-row-main hermes-kanban-md"></div>
     <div class="kanban-detail-row-meta">${esc([by, at].filter(Boolean).join(' · '))}</div>
   </div>`;
 }
@@ -3823,7 +3678,7 @@ function _kanbanRenderTaskDetail(data){
       <div class="kanban-task-preview-title">${esc(title)}</div>
       <button class="btn secondary kanban-edit-btn" onclick="openKanbanEdit(${jsArg(task.id)})" data-i18n="kanban_edit_task" title="${esc(t('kanban_edit_task') || 'Edit task')}">${esc(t('kanban_edit_task') || 'Edit task')}</button>
     </div>
-    <div class="kanban-task-preview-body">${_kanbanRenderMarkdown(body)}</div>
+    <div class="kanban-task-preview-body hermes-kanban-md"></div>
     ${meta.length ? `<div class="kanban-meta">${esc(meta.join(' · '))}</div>` : ''}
     <div class="kanban-status-actions">${statusButtons}</div>
     <div class="kanban-detail-grid">
@@ -3841,9 +3696,13 @@ function _kanbanRenderTaskDetail(data){
 
 async function loadKanbanTask(taskId){
   if (!taskId) return;
+  const generation=++_kanbanDetailGeneration,owner=_kanbanDetailOwner();
+  const isCurrent=()=>generation===_kanbanDetailGeneration&&owner===_kanbanDetailOwner();
   try {
     const data = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + _kanbanBoardQuery());
+    if(!isCurrent())return;
     try { data.log = await api('/api/kanban/tasks/' + encodeURIComponent(taskId) + '/log' + _kanbanBoardQuery({tail: 65536})); } catch(e) { data.log = {}; }
+    if(!isCurrent())return;
     _kanbanCurrentTaskId = taskId;
     const task = data.task || {};
     const title = _kanbanTaskTitle(task);
@@ -3854,12 +3713,14 @@ async function loadKanbanTask(taskId){
     }
     const preview = $('kanbanTaskPreview');
     if (preview) {
+      window.HermesMarkdown?.destroyWithin(preview);
       preview.style.display = '';
       preview.innerHTML = _kanbanRenderTaskDetail(data);
+      _kanbanMountDetailMarkdown(preview,data);
     }
     _closeMobileSidebarAfterPanelSelection();
     showToast(`${t('kanban_task')}: ${title}`);
-  } catch(e) { showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
+  } catch(e) { if(isCurrent())showToast(t('kanban_unavailable') + ': ' + (e.message || e), 'error'); }
 }
 
 // Phase 2: Single-source-of-truth render.
@@ -3985,6 +3846,7 @@ async function loadKanbanBoards(){
   } else if (saved) {
     _kanbanSetSavedBoard('default');
   }
+  if(_kanbanCurrentBoard!==((active==='default')?null:active))closeKanbanTaskDetail();
   _kanbanCurrentBoard = (active === 'default') ? null : active;
   // Keep the switcher visible because it is also the default-board settings path.
   switcher.hidden = false;
@@ -4094,6 +3956,7 @@ async function switchKanbanBoard(slug){
     if (menu) menu.hidden = true;
     return;
   }
+  closeKanbanTaskDetail();
   _kanbanCurrentBoard = newBoard;
   _kanbanSetSavedBoard(slug);
   _kanbanLatestEventId = 0;  // reset cursor — new board has its own event sequence
@@ -4246,6 +4109,7 @@ async function submitKanbanBoardModal(){
       closeKanbanBoardModal();
       // Switch to the new board and reload
       const newSlug = (res && res.board && res.board.slug) || slugInput;
+      closeKanbanTaskDetail();
       _kanbanCurrentBoard = (newSlug === 'default') ? null : newSlug;
       _kanbanSetSavedBoard(newSlug);
       _kanbanLatestEventId = 0;
@@ -4301,6 +4165,7 @@ async function archiveKanbanBoard(){
   try {
     await api('/api/kanban/boards/' + encodeURIComponent(current), {method: 'DELETE'});
     // Server falls back to default — match that locally.
+    closeKanbanTaskDetail();
     _kanbanCurrentBoard = null;
     _kanbanSetSavedBoard('default');
     _kanbanLatestEventId = 0;
@@ -4599,16 +4464,24 @@ function _renderLlmWikiStatus(d) {
 
 async function _openWikiBrowser() {
   const existing = document.getElementById('wikiBrowserOverlay');
-  if (existing) { existing.style.display = 'flex'; return; }
+  if(existing){existing._closeWikiBrowser?.();existing.remove();}
 
   const overlay = document.createElement('div');
   overlay.id = 'wikiBrowserOverlay';
   overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999;';
 
-  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.style.display = 'none'; });
-  document.addEventListener('keydown', function escHandler(e) {
-    if (e.key === 'Escape') { overlay.style.display = 'none'; document.removeEventListener('keydown', escHandler); }
-  });
+  let pageGeneration=0;
+  const profile=S.activeProfile;
+  const close=()=>{
+    pageGeneration++;
+    window.HermesMarkdown?.destroyWithin(overlay);
+    document.removeEventListener('keydown',escHandler);
+    overlay.remove();
+  };
+  const escHandler=e=>{if(e.key==='Escape')close();};
+  overlay._closeWikiBrowser=close;
+  overlay.addEventListener('click',e=>{if(e.target===overlay)close();});
+  document.addEventListener('keydown',escHandler);
 
   const panel = document.createElement('div');
   panel.style.cssText = 'background:var(--bg);border:1px solid var(--border);border-radius:8px;width:min(720px,95vw);max-height:80vh;display:flex;flex-direction:column;overflow:hidden;';
@@ -4616,7 +4489,7 @@ async function _openWikiBrowser() {
   panel.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);">
       <strong style="font-size:14px;">${esc(t('wiki_browse'))}</strong>
-      <button onclick="document.getElementById('wikiBrowserOverlay').style.display='none'" style="background:none;border:none;cursor:pointer;font-size:18px;color:var(--muted);">&#x2715;</button>
+      <button data-wiki-close type="button" aria-label="${esc(t('close'))}" style="background:none;border:none;cursor:pointer;font-size:18px;color:var(--muted);">&#x2715;</button>
     </div>
     <div style="padding:10px 16px;border-bottom:1px solid var(--border);">
       <input id="wikiBrowserSearch" type="text" placeholder="${esc(t('wiki_search_placeholder'))}" style="width:100%;padding:6px 10px;background:var(--input-bg,var(--bg));border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:13px;box-sizing:border-box;" />
@@ -4625,6 +4498,7 @@ async function _openWikiBrowser() {
     <div id="wikiBrowserContent" style="display:none;flex:1;overflow-y:auto;padding:16px;border-top:1px solid var(--border);"></div>`;
 
   overlay.appendChild(panel);
+  panel.querySelector('[data-wiki-close]').onclick=close;
   document.body.appendChild(overlay);
 
   const listEl = document.getElementById('wikiBrowserList');
@@ -4645,23 +4519,30 @@ async function _openWikiBrowser() {
   }
 
   window._wikiBrowserOpenPage = async function(path) {
+    const generation=++pageGeneration;
+    const isCurrent=()=>generation===pageGeneration&&profile===S.activeProfile&&overlay.isConnected;
+    window.HermesMarkdown?.destroyWithin(contentEl);
     contentEl.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:13px;">Loading...</div>';
     contentEl.style.display = 'block';
     listEl.style.display = 'none';
     try {
       const data = await api('/api/wiki/page?path=' + encodeURIComponent(path));
+      if(!isCurrent())return;
       if (typeof renderMarkdownPreviewContent === 'function') {
         contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><div id="wikiBrowserMd"></div>';
-        renderMarkdownPreviewContent({content: data.content, el: document.getElementById('wikiBrowserMd')});
+        renderMarkdownPreviewContent({content:data.content,el:contentEl.querySelector('#wikiBrowserMd'),key:'wiki:'+path,profileId:profile});
       } else {
         contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><pre style="white-space:pre-wrap;word-break:break-word;font-size:12px;margin:0;">' + esc(data.content) + '</pre>';
       }
     } catch(e) {
+      if(!isCurrent())return;
       contentEl.innerHTML = '<button onclick="window._wikiBrowserBack()" style="margin-bottom:10px;background:none;border:1px solid var(--border);border-radius:4px;padding:3px 10px;cursor:pointer;font-size:12px;color:var(--text);">&#8592; Back</button><div style="color:var(--error,#f55);">' + esc(e.message || String(e)) + '</div>';
     }
   };
 
   window._wikiBrowserBack = function() {
+    pageGeneration++;
+    window.HermesMarkdown?.destroyWithin(contentEl);
     contentEl.style.display = 'none';
     listEl.style.display = '';
   };
@@ -4670,6 +4551,7 @@ async function _openWikiBrowser() {
 
   try {
     const data = await api('/api/wiki/browse');
+    if(!overlay.isConnected||profile!==S.activeProfile)return;
     _pages = Array.isArray(data && data.pages) ? data.pages : [];
     if (!_pages.length) {
       listEl.innerHTML = `<div style="padding:12px 16px;color:var(--muted);font-size:13px;">${esc(t('wiki_no_pages'))}</div>`;
@@ -5035,17 +4917,10 @@ function _stripYamlFrontmatter(content) {
   return { frontmatter: m[1], body: content.slice(m[0].length) };
 }
 
-function _skillMarkdownHtml(markdown) {
-  return `<div class="preview-md">${renderMd(markdown || '')}</div>`;
-}
-
-function _enhanceSkillMarkdown(root) {
-  if (!root) return;
-  requestAnimationFrame(() => {
-    const mdRoot = root.querySelector('.preview-md') || root;
-    if (typeof highlightCode === 'function') highlightCode(mdRoot);
-    if (typeof renderKatexBlocks === 'function') renderKatexBlocks(mdRoot);
-  });
+let _skillRequestGeneration=0;
+function _skillRequestGuard(){
+  const generation=++_skillRequestGeneration,profile=S.activeProfile;
+  return ()=>generation===_skillRequestGeneration&&profile===S.activeProfile;
 }
 
 function _renderSkillDetail(name, content, linkedFiles) {
@@ -5060,7 +4935,7 @@ function _renderSkillDetail(name, content, linkedFiles) {
   if (frontmatter) {
     html += `<details class="skill-frontmatter"><summary>${esc(t('skill_metadata'))}</summary><pre><code>${esc(frontmatter)}</code></pre></details>`;
   }
-  html += _skillMarkdownHtml(markdownBody || '(no content)');
+  html += '<div class="preview-md"></div>';
   const lf = linkedFiles || {};
   const categories = Object.entries(lf).filter(([,files]) => files && files.length > 0);
   if (categories.length) {
@@ -5074,8 +4949,10 @@ function _renderSkillDetail(name, content, linkedFiles) {
     }
     html += '</div>';
   }
+  _skillRequestGeneration++;
+  window.HermesMarkdown?.destroyWithin(body);
   body.innerHTML = `<div class="main-view-content skill-detail-content">${html}</div>`;
-  _enhanceSkillMarkdown(body);
+  mountHermesMarkdown(body.querySelector('.preview-md'),markdownBody||'(no content)',{key:'skill:'+name,surface:'preview'});
   body.querySelectorAll('.skill-linked-file').forEach(a => {
     a.addEventListener('click', e => { e.preventDefault(); openSkillFile(a.dataset.skillName, a.dataset.skillFile); });
   });
@@ -5091,6 +4968,7 @@ function _renderSkillError(name, message) {
   const empty = $('skillDetailEmpty');
   if (title) title.textContent = name;
   if (body) {
+    window.HermesMarkdown?.destroyWithin(body);
     body.innerHTML = `<div class="main-view-content"><div class="detail-form-error" style="display:block">${esc(message || t('skill_load_failed'))}</div></div>`;
     body.style.display = '';
   }
@@ -5114,6 +4992,7 @@ function _setSkillHeaderButtons(mode) {
 }
 
 async function openSkill(name, el) {
+  const isCurrent=_skillRequestGuard();
   // Highlight active skill in the sidebar list
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
@@ -5121,6 +5000,7 @@ async function openSkill(name, el) {
   _editingSkillName = null;
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(name)}`);
+    if(!isCurrent())return;
     if (data && (data.success === false || data.error)) {
       const message = data.error || t('skill_load_failed');
       _renderSkillError(name, message);
@@ -5130,12 +5010,14 @@ async function openSkill(name, el) {
     _currentSkillDetail = { name, content: data.content || '', linked_files: data.linked_files || {} };
     _renderSkillDetail(name, data.content || '', data.linked_files || {});
     _closeMobileSidebarAfterPanelSelection();
-  } catch(e) { setStatus(t('skill_load_failed') + e.message); }
+  } catch(e) { if(isCurrent())setStatus(t('skill_load_failed') + e.message); }
 }
 
 async function openSkillFile(skillName, filePath) {
+  const isCurrent=_skillRequestGuard();
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`);
+    if(!isCurrent())return;
     if (data && data.error) {
       _renderSkillError(skillName, data.error);
       setStatus(t('skill_file_load_failed') + data.error);
@@ -5149,11 +5031,12 @@ async function openSkillFile(skillName, filePath) {
     const header = `<div class="skill-file-breadcrumb"><a href="#" class="skill-file-back" data-skill-name="${esc(skillName)}">&larr; ${esc(backLabel)}</a><span class="skill-file-path">${esc(filePath)}</span></div>`;
     let content;
     if (isMd) {
-      content = `<div class="main-view-content">${_skillMarkdownHtml(data.content || '')}</div>`;
+      content = '<div class="main-view-content"><div class="preview-md"></div></div>';
     } else {
       const escaped = esc(data.content || '');
       content = `<pre class="skill-file-code"><code>${escaped}</code></pre>`;
     }
+    window.HermesMarkdown?.destroyWithin(body);
     body.innerHTML = header + content;
     body.style.display = '';
     const empty = $('skillDetailEmpty');
@@ -5168,9 +5051,9 @@ async function openSkillFile(skillName, filePath) {
         }
       });
     });
-    if (isMd) _enhanceSkillMarkdown(body);
-    else requestAnimationFrame(() => { if (typeof highlightCode === 'function') highlightCode(); });
-  } catch(e) { setStatus(t('skill_file_load_failed') + e.message); }
+    if (isMd) mountHermesMarkdown(body.querySelector('.preview-md'),data.content||'',{key:'skill:'+skillName+':'+filePath,surface:'preview'});
+    else requestAnimationFrame(() => { if (isCurrent()&&typeof highlightCode === 'function') highlightCode(body); });
+  } catch(e) { if(isCurrent())setStatus(t('skill_file_load_failed') + e.message); }
 }
 
 function editCurrentSkill() {
@@ -5200,6 +5083,8 @@ function openSkillCreate() {
 }
 
 function _renderSkillForm({ name, category, content, isEdit }) {
+  _skillRequestGeneration++;
+  window.HermesMarkdown?.destroyWithin($('skillDetailBody'));
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
   const empty = $('skillDetailEmpty');
@@ -5249,7 +5134,7 @@ function cancelSkillForm() {
   const body = $('skillDetailBody');
   const empty = $('skillDetailEmpty');
   const title = $('skillDetailTitle');
-  if (body) { body.innerHTML = ''; body.style.display = 'none'; }
+  if (body) { window.HermesMarkdown?.destroyWithin(body); body.innerHTML = ''; body.style.display = 'none'; }
   if (empty) empty.style.display = '';
   if (title) title.textContent = '';
   _setSkillHeaderButtons('empty');
@@ -5317,7 +5202,7 @@ async function deleteCurrentSkill() {
     const body = $('skillDetailBody');
     const empty = $('skillDetailEmpty');
     const title = $('skillDetailTitle');
-    if (body) { body.innerHTML = ''; body.style.display = 'none'; }
+    if (body) { window.HermesMarkdown?.destroyWithin(body); body.innerHTML = ''; body.style.display = 'none'; }
     if (empty) empty.style.display = '';
     if (title) title.textContent = '';
     _setSkillHeaderButtons('empty');
@@ -5409,6 +5294,7 @@ function _renderExternalNotesSources() {
   const body = $('memoryDetailBody');
   const empty = $('memoryDetailEmpty');
   if (!title || !body) return;
+  window.HermesMarkdown?.destroyWithin(body);
   title.textContent = t('external_notes_sources');
   const data = _notesSourcesData || {};
   const sources = Array.isArray(data.sources) ? data.sources : [];
@@ -5436,7 +5322,7 @@ function _renderExternalNotesSources() {
       ? `<div class="notes-search-results">${_notesSearchResults.map(note => `<button type="button" class="notes-result-card" onclick="previewExternalNote(${jsArg(note.source||_notesSelectedSource)},${jsArg(note.id||'')})"><strong>${esc(note.title||'Untitled')}</strong>${note.snippet?`<span>${esc(note.snippet)}</span>`:''}</button>`).join('')}</div>`
       : `<div class="memory-empty">${esc(t('external_notes_search_empty'))}</div>`;
     const previewHtml = _notesPreviewNote
-      ? `<section class="notes-source-card notes-preview-card"><div class="notes-source-card-head"><strong>${esc(_notesPreviewNote.title||'Untitled')}</strong><span class="detail-badge">${esc(_notesPreviewNote.source||_notesSelectedSource)}</span></div><div class="memory-content preview-md">${renderMd(_notesPreviewNote.body||'')}</div></section>`
+      ? `<section class="notes-source-card notes-preview-card"><div class="notes-source-card-head"><strong>${esc(_notesPreviewNote.title||'Untitled')}</strong><span class="detail-badge">${esc(_notesPreviewNote.source||_notesSelectedSource)}</span></div><div class="memory-content preview-md"></div></section>`
       : '';
     const cards = sources.map(src => {
       const status = src.active ? t('source_active') : (src.status || t('source_configured'));
@@ -5464,6 +5350,9 @@ function _renderExternalNotesSources() {
       ${resultHtml}
     </section>`;
     body.innerHTML = `<div class="main-view-content">${recall}${recentAiHtml}${searchUi}${previewHtml}${cards}</div>`;
+    if(_notesPreviewNote)mountHermesMarkdown(body.querySelector('.notes-preview-card .preview-md'),_notesPreviewNote.body||'',{
+      key:JSON.stringify(['note',_notesPreviewNote.source||_notesSelectedSource,_notesPreviewNote.id]),surface:'preview',
+    });
   }
   body.style.display = '';
   if (empty) empty.style.display = 'none';
@@ -5499,9 +5388,11 @@ function _renderMemoryDetail(section) {
     ? `<div class="memory-detail-mtime">${esc(shadowed.map(item => `${item.name || 'Context file'} present, shadowed by ${item.shadowed_by || fileName || 'active context'}`).join('; '))}</div>`
     : '';
   const inner = content
-    ? `<div class="memory-content preview-md">${renderMd(content)}</div>`
+    ? '<div class="memory-content preview-md"></div>'
     : `<div class="memory-empty">${esc(_memorySectionEmpty(meta))}</div>`;
+  window.HermesMarkdown?.destroyWithin(body);
   body.innerHTML = `<div class="main-view-content">${pathHtml}${mtimeHtml}${shadowedHtml}${inner}</div>`;
+  if(content)mountHermesMarkdown(body.querySelector('.preview-md'),content,{key:'memory:'+section,surface:'preview'});
   body.style.display = '';
   if (empty) empty.style.display = 'none';
   _memoryMode = 'read';
@@ -5509,6 +5400,7 @@ function _renderMemoryDetail(section) {
 }
 
 function _renderMemoryEdit(section) {
+  window.HermesMarkdown?.destroyWithin($('memoryDetailBody'));
   const meta = _memorySectionMeta(section);
   const title = $('memoryDetailTitle');
   const body = $('memoryDetailBody');

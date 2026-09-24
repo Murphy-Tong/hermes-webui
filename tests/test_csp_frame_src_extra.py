@@ -96,3 +96,36 @@ def test_csp_frame_src_does_not_affect_connect_src(monkeypatch):
     # ... and NOT leaked into connect-src (which ends at cdn.jsdelivr.net).
     connect_seg = policy.split("connect-src", 1)[1].split(";", 1)[0]
     assert "dash.example.com" not in connect_seg
+
+
+def test_markdown_iframe_bootstrap_only_exact_https_origins(monkeypatch):
+    from api.helpers import _markdown_iframe_origins
+
+    monkeypatch.setenv(
+        "HERMES_WEBUI_CSP_FRAME_EXTRA",
+        "https://Embed.example.com:443 https://embed.example.com:8443 "
+        "https://*.example.com https://example.com:* http://example.com "
+        "https://localhost https://127.0.0.1 https://10.0.0.1 https://host.internal",
+    )
+    assert _markdown_iframe_origins() == [
+        "https://embed.example.com", "https://embed.example.com:8443",
+    ]
+
+
+def test_markdown_iframe_bootstrap_invalid_config_fails_closed(monkeypatch):
+    from api.helpers import _markdown_iframe_origins
+
+    monkeypatch.setenv("HERMES_WEBUI_CSP_FRAME_EXTRA", "https://ok.example.com </script>")
+    assert _markdown_iframe_origins() == []
+    monkeypatch.delenv("HERMES_WEBUI_CSP_FRAME_EXTRA")
+    assert _markdown_iframe_origins() == []
+
+
+def test_media_csp_allows_https_without_changing_script_permissions(monkeypatch):
+    from api.helpers import _build_csp_enforced_policy
+
+    monkeypatch.delenv("HERMES_WEBUI_CSP_FRAME_EXTRA", raising=False)
+    policy = _build_csp_enforced_policy()
+    assert "media-src 'self' data: blob: https:;" in policy
+    script_policy = policy.split("script-src ", 1)[1].split(";", 1)[0]
+    assert script_policy == "'self' 'unsafe-inline' https://cdn.jsdelivr.net https://static.cloudflareinsights.com blob:"
