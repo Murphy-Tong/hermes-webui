@@ -890,8 +890,10 @@ function setLargeMarkdownForceRenderVisible(visible){
 function renderMarkdownPreviewContent(data){
   const target=data&&data.el?data.el:$('previewMd');
   if(!data||!data.el) showPreview('md');
-  target.innerHTML=renderMd(data.content);
-  requestAnimationFrame(()=>{if(typeof renderKatexBlocks==='function')renderKatexBlocks();});
+  return mountHermesMarkdown(target,data?.content||'',{
+    key:data?.key||'preview:'+_previewCurrentPath,surface:'preview',
+    snapshots:data?.media_snapshots,sessionId:data?.sessionId,profileId:data?.profileId,
+  });
 }
 
 function renderCodePreviewContent(path, content){
@@ -949,6 +951,14 @@ function forceRenderMarkdownPreview(){
   setStatus('Markdown rendered for this file.');
 }
 
+// 请求世代同时保护同一路径重开、关闭，以及异步保存后的重新渲染。
+let _previewRequestGeneration = 0;
+let _previewContentOwner = '';
+function _previewOwner(){return JSON.stringify([S.activeProfile,S.session?.session_id]);}
+function _previewRequestGuard(){
+  const generation=_previewRequestGeneration,owner=_previewOwner(),path=_previewCurrentPath;
+  return ()=>generation===_previewRequestGeneration&&owner===_previewOwner()&&path===_previewCurrentPath;
+}
 let _previewCurrentPath = '';  // relative path of currently previewed file
 let _previewCurrentMode = '';  // 'code' | 'csv' | 'md' | 'image' | 'html' | 'pdf' | 'audio' | 'video'
 let _previewDirty = false;     // true when edits are unsaved
@@ -958,6 +968,7 @@ let _previewOfficeFormat = '';  // current claimed Office format, if any
 let _previewPreviewKind = '';  // preview family returned by the backend
 
 function showPreview(mode){
+  if(mode!=='md')window.HermesMarkdown?.destroyWithin($('previewMd'));
   // mode: 'code' | 'csv' | 'image' | 'md' | 'html' | 'pdf' | 'audio' | 'video'
   $('previewCode').style.display     = mode==='code'  ? '' : 'none';
   $('previewImgWrap').style.display  = mode==='image' ? '' : 'none';
@@ -1007,10 +1018,12 @@ async function toggleEditMode(){
     // Save
     if(!S.session||!_previewCurrentPath)return;
     const content=$('previewEditArea').value;
+    const isCurrent=_previewRequestGuard();
     try{
       const saved=await api(_previewSaveRoute||'/api/file/save',{method:'POST',body:JSON.stringify({
         session_id:S.session.session_id, path:_previewCurrentPath, content
       })});
+      if(!isCurrent())return;
       const savedContent=saved&&typeof saved.content==='string'?saved.content:content;
       if(saved && typeof saved.editable==='boolean') _previewServerEditable = saved.editable;
       if(saved && saved.preview_kind) _previewPreviewKind = saved.preview_kind;
@@ -1031,7 +1044,7 @@ async function toggleEditMode(){
       if(_previewCurrentMode==='code') $('previewCode').style.display='';
       else $('previewMd').style.display='';
       showToast(t('saved'));
-    }catch(e){setStatus(t('save_failed')+e.message);}
+    }catch(e){if(isCurrent())setStatus(t('save_failed')+e.message);}
   }else{
     // Enter edit mode: populate textarea with current content
     const currentText = _previewCurrentMode==='code'
@@ -1109,6 +1122,13 @@ async function openFile(path, opts={}){
     return;
   }
 
+  const owner=_previewOwner();
+  if(_previewCurrentPath!==path||_previewContentOwner!==owner){
+    window.HermesMarkdown?.destroyWithin($('previewMd'));
+    _previewRawContent='';_previewRawContentPath='';
+  }
+  _previewContentOwner=owner;
+  _previewRequestGeneration++;
   _previewServerEditable = null;
   _previewSaveRoute = '/api/file/save';
   _previewOfficeFormat = '';
@@ -1119,6 +1139,7 @@ async function openFile(path, opts={}){
   $('fileTree').style.display='none';
 
   _previewCurrentPath = path;
+  const isCurrent=_previewRequestGuard();
   renderFileBreadcrumb(path);
   if(IMAGE_EXTS.has(ext)){
     // Image: load via raw endpoint, show as <img>
@@ -1158,6 +1179,7 @@ async function openFile(path, opts={}){
       const data=forceRichMarkdown&&path===_previewRawContentPath&&_previewRawContent
         ? {content:_previewRawContent}
         : await api(_workspaceRouteForPath(path, 'read'));
+      if(!isCurrent())return;
       _previewRawContent = data.content;
       _previewRawContentPath = path;
       if(!forceRichMarkdown && shouldRenderMarkdownPreviewAsPlainText(data.content)){
@@ -1168,7 +1190,7 @@ async function openFile(path, opts={}){
         return;
       }
       renderMarkdownPreviewContent(data);
-    }catch(e){setStatus(t('file_open_failed'));}
+    }catch(e){if(isCurrent())setStatus(t('file_open_failed'));}
   } else if(HTML_EXTS.has(ext)){
     // HTML: render in sandboxed iframe via raw endpoint.
     // SECURITY TRADEOFF: We use sandbox="allow-scripts" which lets inline JS run
@@ -1188,6 +1210,7 @@ async function openFile(path, opts={}){
   } else if(ext==='.csv'){
     try{
       const data=await api(_workspaceRouteForPath(path, 'read'));
+      if(!isCurrent())return;
       if(data.binary){
         downloadFile(path);
         return;
@@ -1195,12 +1218,13 @@ async function openFile(path, opts={}){
       if(renderCsvPreviewContent(path, data.content)) return;
       renderCodePreviewContent(path, data.content);
     }catch(e){
-      downloadFile(path);
+      if(isCurrent())downloadFile(path);
     }
   } else {
     // Plain code / text -- but fall back to download if server signals binary
     try{
       const data=await api(_workspaceRouteForPath(path, 'read'));
+      if(!isCurrent())return;
       if(data.binary){
         // Server flagged this as binary content
         downloadFile(path);
@@ -1216,6 +1240,7 @@ async function openFile(path, opts={}){
       }
       renderCodePreviewContent(path, data.content);
   }catch(e){
+      if(!isCurrent())return;
       const grant = _workspaceEscapeGrantForPath(path);
       if(grant && e && e.status===403){
         _clearWorkspaceEscapeGrant(grant.path);

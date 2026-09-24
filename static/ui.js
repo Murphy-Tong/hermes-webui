@@ -7,6 +7,54 @@
 // See api/todo_state.py for the wire contract.
 const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null,_pendingSessionToolsets:null};
 
+// 每次挂载捕获身份；资源解析和点击回调不得读取另一个会话的路径上下文。
+function hermesMarkdownContext(surface='chat',options={}){
+  if(surface==='share')return {surface:'share'};
+  const sessionId=String(options.sessionId??S.session?.session_id??'');
+  const profileId=String(options.profileId??S.activeProfile??'default');
+  const isCurrent=()=>S.session?.session_id===sessionId&&S.activeProfile===profileId;
+  const localPath=source=>{
+    if(/^file:\/\//i.test(source)){
+      const url=new URL(source);
+      if(url.hostname&&url.hostname!=='localhost')throw new Error('不支持远程 file 主机');
+      return decodeURIComponent(url.pathname);
+    }
+    return decodeURIComponent(source.replace(/^workspace:\/\//i,'')).replace(/^~\//,'').replace(/^\.\//,'');
+  };
+  return {surface,sessionId,profileId,snapshots:{...options.snapshots},
+    iframeOrigins:[...(window.__HERMES_CONFIG__?.markdownIframeOrigins||[])],
+    resolveMedia(source){
+      if(!sessionId)return '';
+      const path=localPath(source);
+      if(!path||/[\u0000-\u001f\u007f\\]/.test(path))return '';
+      const route=/^file:\/\//i.test(source)?'api/media':'api/file/raw';
+      const url=new URL(route,document.baseURI);
+      url.searchParams.set('path',path);
+      url.searchParams.set('session_id',sessionId);
+      url.searchParams.set('inline','1');
+      return url.href;
+    },
+    openLink(source){
+      if(!isCurrent())return;
+      try{
+        if(/^session:\/\//i.test(source)){
+          const sid=decodeURIComponent(source.replace(/^session:\/\//i,'').split(/[?#]/)[0]);
+          if(sid&&typeof loadSession==='function')loadSession(sid);
+        }else if(typeof openArtifactPath==='function')openArtifactPath(localPath(source));
+      }catch(_){}
+    },
+    openImage(src,alt){if(isCurrent())_openImgLightboxWithNav(src,alt,[{src,alt}],0);},
+  };
+}
+
+function mountHermesMarkdown(element,content,options={}){
+  if(!element)return null;
+  const context=options.context||hermesMarkdownContext(options.surface||'chat',options);
+  if(!window.HermesMarkdown){element.textContent=String(content||'');return null;}
+  return window.HermesMarkdown.mount(element,{key:options.key||element.id||'markdown',
+    content:String(content||''),final:options.final!==false,context});
+}
+
 function assistantDisplayName(){
   if(S.activeProfile&&S.activeProfile!=='default') return S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
   return window._botName||'Hermes';
@@ -361,7 +409,7 @@ function _renderUserFencedBlocks(text){
   // <pre><code> instead of as literal source. Mirrors renderMd()'s ordering.
   // CommonMark §4.5 line-anchored fence: the closing run must use at least
   // as many backticks as the opener, so inner triple-backtick fences remain content.
-  s=s.replace(/(^|\n)[ ]{0,3}(`{3,})([^\n`]*)\n(?:([\s\S]*?)\n)?[ ]{0,3}\2`*[ \t]*(?=\n|$)/g,(_,lead,_fence,info,code)=>{
+  s=s.replace(/(^|\x0a)[ ]{0,3}(`{3,})([^\x0a`]*)\x0a(?:([\s\S]*?)\x0a)?[ ]{0,3}\2`*[ \t]*(?=\x0a|$)/g,(_,lead,_fence,info,code)=>{
     const langInfo=(info||'').trim();
     const langMatch=langInfo.match(/^(\w[\w+-]*)$/);
     let lang=langMatch?(langMatch[1]||'').trim().toLowerCase():'';
@@ -975,6 +1023,9 @@ function _captureMessageViewportAnchor(){
       const topPadBefore=spacer?parseFloat(spacer.style.height||'0')||0:0;
       return {
         rawIdx,
+        node:row,
+        owner:JSON.stringify([S.activeProfile,S.session?.session_id]),
+        renderKey:row.dataset.messageRenderKey||'',
         sessionIdx:Number.isFinite(sessionIdx)?sessionIdx:_messageSessionIndexForRawIdx(rawIdx),
         key:row&&row.dataset?String(row.dataset.messageAnchorKey||''):'',
         topOffset:rect.top-containerRect.top,
@@ -1097,7 +1148,10 @@ function _restoreMessageViewportAnchor(anchor, rawIdxDelta){
   const anchorKey=String(anchor.key||'');
   const sessionIdx=Number(anchor.sessionIdx);
   const hasSessionIdx=Number.isFinite(sessionIdx);
-  let row=anchorKey?Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el&&el.dataset&&el.dataset.messageAnchorKey===anchorKey):null;
+  if(anchor.owner&&anchor.owner!==JSON.stringify([S.activeProfile,S.session?.session_id])) return false;
+  let row=anchor.node?.isConnected&&container.contains(anchor.node)?anchor.node:null;
+  if(!row&&anchor.renderKey) row=Array.from(container.querySelectorAll('[data-message-render-key]')).find(el=>el.dataset.messageRenderKey===anchor.renderKey);
+  if(!row&&anchorKey) row=Array.from(container.querySelectorAll('[data-message-anchor-key]')).find(el=>el.dataset.messageAnchorKey===anchorKey);
   if(row&&row.getClientRects&&row.getClientRects().length===0) row=null;
   // The anchor key is content-derived (role|ts|attachments|first-160-chars, built by
   // _messageViewportAnchorKeyForMessage) so it goes STALE while a live assistant
@@ -6086,7 +6140,7 @@ let _lastMessageRenderAt=-Infinity;
 function _recentMessageRenderArtifactWindow(ms){
   return performance.now()-_lastMessageRenderAt<(ms||1400);
 }
-function _cancelBottomSettle(){ _cancelMessageJumpScroll(); _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); }
+function _cancelBottomSettle(){ _cancelMessageJumpScroll(); _bottomSettleToken++; if(_settleRO){ _settleRO.disconnect(); _settleRO=null; } clearTimeout(_settleTimer); clearTimeout(_settleFinalTimer); cancelAnimationFrame(_settleRAF); _settleRAF=0; }
 function _markMessageTouchScrollIntent(active=true){
   _messageTouchScrollActive=!!active;
   _lastMessageTouchScrollIntentMs=performance.now();
@@ -6147,7 +6201,7 @@ function _recordNonMessageScrollIntent(e){
   const jumpScrollOwned=typeof _messageJumpScrollOwner!=='undefined'&&!!_messageJumpScrollOwner;
   if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
     if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
-    if(jumpScrollOwned||e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
+    if(jumpScrollOwned||e.type==='touchmove'||wheelUp||guardedWheelUp){
       if(typeof _cancelBottomSettle==='function') _cancelBottomSettle();
     }
   }
@@ -6165,9 +6219,9 @@ function _recordNonMessageScrollIntent(e){
   }
   if(typeof e.deltaY==='number'&&e.deltaY<0) _lastMessageWheelIntentMs=performance.now();
   // Keep e.deltaY< -30 as the ordinary direct sticky-unpin threshold.
-  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
+  if(e.type==='touchmove'||wheelUp||guardedWheelUp){
     if(e.type==='touchmove') _markMessageTouchScrollIntent(true);
-    if((typeof e.deltaY==='number'&&e.deltaY< -30)||guardedWheelUp){
+    if(wheelUp||guardedWheelUp){
       _messageUserUnpinned=true;
       _nearBottomCount=0;
       _scrollPinned=false;
@@ -6504,7 +6558,7 @@ if(typeof window!=='undefined'){
         _nearBottomCount=0;
         _scrollPinned=false;
         _messageUserUnpinned=true;
-      }else if(movedDown&&nearBottom){
+      }else if(movedDown&&nearBottom&&(_recentMessageScrollIntent()||_recentMessageTouchScrollIntent()||_recentMessageWheelIntent()||_recentMessageKeyScrollIntent())){
         _nearBottomCount=_nearBottomCount+1;
         if(_nearBottomCount>=2){
           // Only re-pin when the reader has genuinely reached the true bottom
@@ -7135,29 +7189,28 @@ document.addEventListener('DOMContentLoaded',function(){
   tooltip.addEventListener('click',function(e){e.stopPropagation();});
 });
 
+let _messageBottomFrameOwner='';
+let _messageBottomObserverOwner='';
+function _messageScrollOwner(){
+  return JSON.stringify([S.activeProfile,S.session?.session_id,_messageScrollInputGeneration,_bottomSettleToken]);
+}
 function _setMessageScrollToBottom(){
   const el=$('messages');
-  if(!el) return;
-  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-  el.scrollTop=el.scrollHeight;
-  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
-  _nearBottomCount=2;
-  _scrollPinned=true;
-  requestAnimationFrame(()=>{
-    // Retry the bottom write on the next layout frame so a DOM rebuild that
-    // grows the transcript after the first write doesn't strand a pinned
-    // conversation mid-scroll (#3319). But by this frame the user may have
-    // scrolled up — under the sticky-unpin model (#3343) _messageUserUnpinned
-    // is the authoritative "user scrolled away" signal, so DON'T snap them back
-    // or re-pin if so; only release the programmatic-scroll latch.
-    if(_messageUserUnpinned || !_scrollPinned || _recentNonMessageScrollIntent()){
-      _deferClearProgrammaticScroll();
-      return;
-    }
+  if(!el||_messageUserUnpinned||!_scrollPinned||_recentNonMessageScrollIntent()) return;
+  const owner=_messageScrollOwner();
+  if(_settleRAF&&_messageBottomFrameOwner===owner) return;
+  cancelAnimationFrame(_settleRAF);
+  _messageBottomFrameOwner=owner;
+  // Vue 与原生调用方共用帧队列；每帧只写一次，执行时重新核验阅读意图。
+  _settleRAF=requestAnimationFrame(()=>{
+    _settleRAF=0;
+    if(owner!==_messageScrollOwner()||!el.isConnected||_messageUserUnpinned||!_scrollPinned||_recentNonMessageScrollIntent()) return;
+    _programmaticScroll=true;
+    _programmaticScrollSetAt=performance.now();
     el.scrollTop=el.scrollHeight;
-    _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
+    _lastScrollTop=el.scrollTop;
+    _lastMessageClientHeight=el.clientHeight;
     _nearBottomCount=2;
-    _scrollPinned=true;
     _deferClearProgrammaticScroll();
   });
 }
@@ -7206,104 +7259,29 @@ function _followMessagesAfterDomReplace(){
   return false;
 }
 function _settleMessageScrollToBottom(force, explicit){
-  // `explicit` = a user-invoked scroll-to-bottom (End button / scrollToBottom()).
-  // When explicit, late-layout settling runs even if Auto-follow is OFF — the
-  // setting only suppresses AUTOMATIC streaming follow, not a deliberate jump
-  // to the bottom. (Codex #4006 r3.)
-  // can grow the transcript after the first scroll write. Re-apply the bottom
-  // position when content settles so late layout does not leave the viewport
-  // above the real end. User scroll increments _bottomSettleToken and cancels.
-  //
-  // Firefox paints each scrollTop write as a visible reflow step. The old
-  // rAF-polling approach read scrollHeight across frames — the read itself
-  // forced a reflow in Firefox, causing visible jitter.
-  //
-  // ResizeObserver approach: the browser notifies us when the container
-  // resizes (no scrollHeight polling needed). On each notification we write
-  // scrollTop once via rAF (batches multiple resize callbacks per frame into
-  // a single write). After 300ms of no resize events, the observer disconnects.
-  const token=++_bottomSettleToken;
-  cancelAnimationFrame(_settleRAF);
-  if(_settleRO){ _settleRO.disconnect(); _settleRO=null; }
-  clearTimeout(_settleTimer);
-  clearTimeout(_settleFinalTimer);
-
-  // Sync write anchors the viewport immediately.
+  if(_messageUserUnpinned||!_scrollPinned||(!explicit&&!window._autoScrollFollow)) return;
   _setMessageScrollToBottom();
-
-  if(force) return;
-
-  const el=document.getElementById('messages');
-  if(!el) return;
-  // Observe the GROWING content node, not the scroll container. #messages is the
-  // scroller but its box is fixed by the flex layout, so it never resizes — the
-  // transcript grows inside #msgInner (.messages-inner). Observing #messages
-  // would mean the callback never fires. (Codex review #2.)
-  const observed=document.getElementById('msgInner')||el;
-
-  // Instance-owned cleanup: close over THIS observer so a stale callback (from a
-  // superseded settle) only ever disconnects its own observer, never the newer
-  // active one that may now be in the global _settleRO. (Codex review #3.)
+  const owner=_messageScrollOwner();
+  if(force||(_settleRO&&_messageBottomObserverOwner===owner)) return;
+  _settleRO?.disconnect();
+  const el=$('messages'),inner=$('msgInner');
+  if(!el||!inner) return;
+  _messageBottomObserverOwner=owner;
   const ro=new ResizeObserver(()=>{
-    if(token!==_bottomSettleToken){ ro.disconnect(); if(_settleRO===ro) _settleRO=null; return; }
-    if((!window._autoScrollFollow&&!explicit)||!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent()){
-      ro.disconnect(); if(_settleRO===ro) _settleRO=null;
-      _programmaticScroll=false;
+    if(owner!==_messageScrollOwner()||_messageUserUnpinned||!_scrollPinned||(!explicit&&!window._autoScrollFollow)){
+      ro.disconnect();
+      if(_settleRO===ro) _settleRO=null;
       return;
     }
-    // Write scrollTop once per frame — ResizeObserver batches multiple
-    // notifications per frame, so this is at most one write per frame.
-    cancelAnimationFrame(_settleRAF);
-    _settleRAF=requestAnimationFrame(()=>{
-      if(token!==_bottomSettleToken) return;
-      _setMessageScrollToBottom();
-    });
-    // After 300ms of quiet, disconnect — layout is stable.
-    clearTimeout(_settleTimer);
-    _settleTimer=setTimeout(()=>{
-      if(token!==_bottomSettleToken) return;
-      ro.disconnect(); if(_settleRO===ro) _settleRO=null;
-      _setMessageScrollToBottom();
-    },300);
+    _setMessageScrollToBottom();
   });
   _settleRO=ro;
-  ro.observe(observed);
-  // #4702: for an explicit (user/open) settle, also observe the SCROLLER itself.
-  // On iOS the transcript content (#msgInner) may not resize, but the scroller
-  // grows when the portrait toolbar collapses after first paint — observing both
-  // re-anchors the bottom after that late viewport settle. Desktop never resizes
-  // here, so this is a no-op off-mobile.
-  if(explicit&&observed!==el){ try{ ro.observe(el); }catch(_){ } }
-
-  // Static-content safety net: a fully-static response (no Prism/KaTeX/Mermaid/
-  // late images) never resizes after the initial sync write, so the
-  // ResizeObserver callback above never fires and its 300ms quiet-timer is never
-  // armed. Arm a single 2s top-level fallback so a late settle still runs for
-  // that case. The token check inside _settleFinalScroll makes this a no-op if a
-  // newer settle started, and it self-skips if the user unpinned. (Review #2/#3.)
-  clearTimeout(_settleFinalTimer);
-  _settleFinalTimer=setTimeout(()=>{
-    if(token!==_bottomSettleToken) return;
-    ro.disconnect(); if(_settleRO===ro) _settleRO=null;
-    if((!window._autoScrollFollow&&!explicit)||!_scrollPinned||_messageUserUnpinned||_recentNonMessageScrollIntent()){ _programmaticScroll=false; return; }
-    _settleFinalScroll(token);
-  },2000);
+  ro.observe(inner);
+  ro.observe(el);
 }
 
 function _settleFinalScroll(token){
-  if(token!==_bottomSettleToken) return;
-  const el=document.getElementById('messages');
-  if(!el){ _programmaticScroll=false; return; }
-  if(_messageUserUnpinned||!_scrollPinned||_recentNonMessageScrollIntent()||_recentMessageTouchScrollIntent()){
-    _programmaticScroll=false;
-    return;
-  }
-  _programmaticScroll=true;_programmaticScrollSetAt=performance.now();
-  el.scrollTop=el.scrollHeight;
-  _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
-  _nearBottomCount=2;
-  _scrollPinned=true;
-  _deferClearProgrammaticScroll();
+  if(token===_bottomSettleToken) _setMessageScrollToBottom();
 }
 function scrollIfPinned(){
   if(!window._autoScrollFollow) return;
@@ -7312,24 +7290,8 @@ function scrollIfPinned(){
   // reclaim the bottom while it is active (#6621). _finishMessageJumpScroll()
   // reconciles the pin state once the jump settles.
   if(typeof _messageJumpScrollOwner!=='undefined'&&_messageJumpScrollOwner) return;
-  if(_messageUserUnpinned){
-    // Only scrollToBottom() cleared this flag, so one scroll-up permanently
-    // killed auto-follow. Re-pin ONLY when the reader has genuinely returned to
-    // the true bottom tail (<=80px), NOT on mere near-bottom proximity — the
-    // #4295 invariant is that proximity alone (inside the ~250px band) must not
-    // re-pin, or a reader scanning the last few lines gets yanked to the bottom
-    // mid-stream. Also bail on ANY recent message-pane scroll intent (wheel,
-    // key, touch) and non-message intent, so an active scroll-up near the tail
-    // is never overridden. Uses the same _nearBottomCount debounce as the
-    // scroll listener (~4859-4866).
-    if(_recentNonMessageScrollIntent()||_recentMessageScrollIntent()||_recentMessageTouchScrollIntent()||_recentMessageWheelIntent()||_recentMessageKeyScrollIntent()){ _nearBottomCount=0; return; }
-    if(_messageBottomDistance()>80){ _nearBottomCount=0; return; }
-    _nearBottomCount=_nearBottomCount+1;
-    if(_nearBottomCount<2) return;
-    _nearBottomCount=0;
-    _messageUserUnpinned=false;
-    _scrollPinned=true;
-  }
+  // token、完成与布局事件没有重新开启跟随的权限。
+  if(_messageUserUnpinned) return;
   if(!_scrollPinned) return;
   if(_recentNonMessageScrollIntent()) return;
   if(_messageBottomDistance()>500) _setMessageScrollToBottom();
@@ -7764,7 +7726,7 @@ function renderMd(raw){
   // ``` inside a code block (e.g. a nested markdown example) terminates the outer
   // block at the wrong place, leaking content into the markdown stream where
   // bold/italic/inline-code passes corrupt it. Fixes #1438 and #1696.
-  s=s.replace(/(^|\n)[ ]{0,3}(`{3,})([^\n`]*)\n(?:([\s\S]*?)\n)?[ ]{0,3}\2`*[ \t]*(?=\n|$)/g,(_,lead,_fence,info,code)=>{
+  s=s.replace(/(^|\x0a)[ ]{0,3}(`{3,})([^\x0a`]*)\x0a(?:([\s\S]*?)\x0a)?[ ]{0,3}\2`*[ \t]*(?=\x0a|$)/g,(_,lead,_fence,info,code)=>{
     const langInfo=(info||'').trim();
     const langMatch=langInfo.match(/^(\w[\w+-]*)$/);
     const lang=langMatch?(langMatch[1]||'').trim().toLowerCase():'';
@@ -7909,7 +7871,7 @@ function renderMd(raw){
   //   - Inner text must not contain newlines or `*` (single-line bold only).
   //   - Runs after fenced code, math, and raw <pre> are stashed, so code
   //     content is protected (see pipeline notes).
-  s=s.replace(/([.!?])\*\*([^*\n]{1,80})\*\*\n\n/g,'$1\n\n**$2**\n\n');
+  s=s.replace(/([.!?])\*\*([^*\x0a]{1,80})\*\*\x0a\x0a/g,'$1\x0a\x0a**$2**\x0a\x0a');
   // Inline backtick spans: restore <code> tags produced in the stash callback above.
   // Must happen BEFORE bold/italic so **`code`** → <strong><code>code</code></strong>.
   s=s.replace(/\x00F(\d+)\x00/g,(_,i)=>fence_stash[+i]);
@@ -13440,16 +13402,23 @@ function _anchorSceneRowTimestampSeconds(row){
 function _anchorSceneNodeForRow(row, opts){
   const settled=!!(opts&&opts.settled);
   if(!row) return null;
+  const existing=opts?.existing;
+  const signature=JSON.stringify([row,settled,window._showThinking]);
+  if(existing?._anchorSceneRenderSignature===signature) return existing;
   let node=null;
   if(row.role==='prose'){
     const text=String(row.text||'').trim();
     if(!text) return null;
-    // Incremental live rendering: reuse a persistent smd node fed only the delta
-    // instead of re-parsing the whole growing answer on every streamed frame
-    // (O(n^2) -> O(n)). Settled rows and any failure fall through to the full
-    // renderMd path below, which stays the source of truth for the final DOM.
+    // 实时与终态使用同一个组件入口；行身份仍由 activity scene 所有。
     const proseKey=row.local_id||row.row_id||'';
-    if(!settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
+    if(existing?.querySelector('.msg-body')){
+      node=existing;
+      node.dataset.rawText=text;
+      mountHermesMarkdown(node.querySelector('.msg-body'),text,{
+        key:proseKey||'anchor-prose',final:settled||row.status==='completed',
+      });
+    }
+    if(!node && !settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
       const inc=window.__anchorProseIncrementalNode(proseKey,text,{
         finalize:String(row.status||'').toLowerCase()==='completed',
       });
@@ -13464,7 +13433,10 @@ function _anchorSceneNodeForRow(row, opts){
       node.className='assistant-segment';
       node.setAttribute('data-anchor-scene-prose','1');
       node.dataset.rawText=text;
-      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+      node.innerHTML='<div class="msg-body"></div>';
+      mountHermesMarkdown(node.firstElementChild,text,{
+        key:proseKey||'anchor-prose',final:settled||row.status==='completed',
+      });
     }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
@@ -13511,6 +13483,7 @@ function _anchorSceneNodeForRow(row, opts){
   if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
+  node._anchorSceneRenderSignature=signature;
   return node;
 }
 function _anchorSceneTransparentNodeForRow(row, opts){
@@ -13538,7 +13511,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     const finalAnswer=String((opts&&opts.finalAnswer)||'').trim();
     if(opts&&opts.liveTokenFinalPrefixEligible&&_anchorSceneLiveTokenFinalPrefix(row,text,finalAnswer)) return null;
     if(finalAnswer&&_anchorSceneProseMatchesFinalAnswer(text,finalAnswer)) return null;
-    node=_anchorSceneNodeForRow(row,{settled});
+    node=_anchorSceneNodeForRow(row,{...opts,settled});
     if(!node) return null;
     node=_decorateTransparentEventRow(node,{type:'prose',text,preview:text,...meta});
   }else if(row.role==='thinking'){
@@ -13668,29 +13641,37 @@ function _anchorSceneWorklogGroup(blocks, opts){
 function _renderAnchorSceneRowsIntoWorklog(group, rows, opts){
   const list=_toolWorklogListEl(group);
   if(!group||!list) return false;
-  list.innerHTML='';
+  // 列表只对账自己的行；正文组件和已展开的工具卡保持连接。
+  const listRows=_messageNodeReconciler(list);
   let wrote=false;
-  let currentTools=null;
+  let toolRows=null;
   for(const row of rows){
-    const node=_anchorSceneNodeForRow(row,opts);
-    if(!node) continue;
+    const key=JSON.stringify([row.row_id||row.local_id,row.role,row.source_event_type]);
     if(row.role==='tool'){
-      if(!currentTools){
-        currentTools=document.createElement('div');
-        currentTools.className='wl-step-tools tool-worklog-tools';
-        currentTools.setAttribute('data-worklog-tools','1');
-        list.appendChild(currentTools);
+      if(!toolRows){
+        const toolsKey='tools:'+key;
+        let tools=listRows.get(toolsKey);
+        if(!tools){
+          tools=document.createElement('div');
+          tools.className='wl-step-tools tool-worklog-tools';
+          tools.setAttribute('data-worklog-tools','1');
+        }
+        listRows.place(tools,toolsKey,false);
+        toolRows=_messageNodeReconciler(tools);
       }
-      currentTools.appendChild(node);
-    }else{
-      currentTools=null;
-      list.appendChild(node);
+    }else if(toolRows){
+      toolRows.finish();
+      toolRows=null;
     }
+    const reconciler=toolRows||listRows;
+    const node=_anchorSceneNodeForRow(row,{...opts,existing:reconciler.get(key)});
+    if(!node) continue;
+    reconciler.place(node,key,false);
     wrote=true;
   }
-  if(wrote){
-    _syncToolCallGroupSummary(group);
-  }
+  toolRows?.finish();
+  listRows.finish();
+  _syncToolCallGroupSummary(group);
   return wrote;
 }
 function _liveProcessedWorklogAnchorScore(group, index){
@@ -13931,8 +13912,13 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
     : null;
   const scrollSnapshot=_captureMessageScrollSnapshot();
   const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
-  blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
-  blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"],.interim-collapse-toggle').forEach(el=>el.remove());
+  const activityKey=`live:${streamId||S.activeStreamId||'anchor'}`;
+  blocks.querySelectorAll('[data-anchor-scene-owner="1"],:scope > [data-anchor-scene-row="1"]').forEach(el=>{
+    if(el.dataset.toolWorklogKey!==activityKey) _destroyMessageNode(el);
+  });
+  blocks.querySelectorAll('.live-worklog[data-live-worklog-shell="1"],.tool-worklog-group[data-live-tool-call-group="1"],.tool-call-group[data-live-tool-call-group="1"],.tool-card-row[data-live-tid]:not(.transparent-event-row),.agent-activity-thinking[data-live-thinking="1"],.interim-collapse-toggle').forEach(el=>{
+    if(!el.closest('[data-anchor-scene-owner="1"]')) _destroyMessageNode(el);
+  });
   blocks.querySelectorAll('[data-live-assistant="1"]').forEach(el=>{
     el.classList.add('assistant-segment-worklog-source');
     el.setAttribute('aria-hidden','true');
@@ -13941,16 +13927,11 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   const group=_anchorSceneWorklogGroup(blocks,{
     live:true,
     collapsed:false,
-    activityKey:`live:${streamId||S.activeStreamId||'anchor'}`,
+    activityKey,
     streamId:streamId||S.activeStreamId||'',
     turnStartedAt:S.session&&S.session.pending_started_at,
   });
-  const ok=_renderAnchorSceneRowsIntoWorklog(group,rows,{live:true,settled:false});
-  if(!ok){
-    const list=_toolWorklogListEl(group);
-    if(list) list.innerHTML='';
-    _syncToolCallGroupSummary(group);
-  }
+  _renderAnchorSceneRowsIntoWorklog(group,rows,{live:true,settled:false});
   if(typeof _restoreWorklogDetailDisclosureState==='function') _restoreWorklogDetailDisclosureState(blocks, liveDisclosureState);
   if(typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(group);
   _dedupeLiveProcessedWorklogAnchors(turn);
@@ -14024,7 +14005,9 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   const renderedRows=[];
   for(const row of rows){
     const rowEventTs=typeof _anchorSceneRowTimestampSeconds==='function'?_anchorSceneRowTimestampSeconds(row):null;
+    const rowKey=`${activeStreamId}\u0000${row.row_id||row.local_id||''}\u0000${row.role||'activity'}\u0000${row.source_event_type||''}`;
     const node=_anchorSceneTransparentNodeForRow(row,{
+      existing:preserveByKey.get(rowKey),
       live:true,
       settled:false,
       streamId:streamId||S.activeStreamId||'',
@@ -14058,7 +14041,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     else blocks.appendChild(renderedNode);
     expectedNextSibling=renderedNode;
   }
-  preserveByKey.forEach(stale=>stale.remove());
+  preserveByKey.forEach(stale=>_destroyMessageNode(stale));
   if(renderedRows.length) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
@@ -14347,11 +14330,18 @@ function _refreshTransparentLiveRow(existing, node, opts){
   if(!existing || !node || !existing.getAttribute) return node;
   if(existing===node) return existing;
   const preservedState = _transparentLiveRowInteractiveState(existing);
-  const candidateIsFadeProse = node.getAttribute('data-anchor-row-role') === 'prose' &&
-    node.querySelector &&
-    !!node.querySelector('.msg-body.stream-fade-active,.stream-fade-word');
-  if(candidateIsFadeProse){
-    return _refreshTransparentFadeProseRow(existing, node, preservedState);
+  if(node.getAttribute('data-anchor-row-role')==='prose'){
+    // 只传递源文本，不能把 Vue 子树序列化后复制到另一个 host。
+    const body=existing.querySelector('.msg-body');
+    if(!body) return node;
+    const text=String(node.dataset.rawText||'');
+    existing.dataset.rawText=text;
+    mountHermesMarkdown(body,text,{
+      key:body.dataset.hermesMarkdownHost||node.dataset.anchorLocalId||node.dataset.anchorRowId,
+      final:node.hasAttribute('data-anchor-settled-scene-row'),
+    });
+    window.HermesMarkdown?.destroyWithin(node);
+    return existing;
   }
   const pairs = _transparentLiveRowAttributePairs(node);
   const kept = Object.create(null);
@@ -16377,12 +16367,14 @@ function _captureMessageScrollSnapshot(){
     bottom,
     scrollHeight:el.scrollHeight,
     inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
+    owner:JSON.stringify([S.activeProfile,S.session?.session_id]),
     pinned:readerAwayFromBottom?false:_shouldFollowMessagesOnDomReplace(),
     userUnpinned:readerAwayFromBottom?true:_messageUserUnpinned,
   };
 }
 function _messageScrollSnapshotInputChanged(snapshot){
   if(!snapshot) return false;
+  if(snapshot.owner&&snapshot.owner!==JSON.stringify([S.activeProfile,S.session?.session_id])) return true;
   const captured=Number(snapshot.inputGeneration);
   const current=typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : captured;
   return Number.isFinite(captured)&&Number.isFinite(current)&&current!==captured;
@@ -16401,11 +16393,7 @@ function _abandonMessageScrollSnapshot(){
   // ownership from the live viewport so a reader who moved down to the true
   // bottom is immediately re-pinned instead of being stranded sticky-unpinned.
   const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
-  if(bottomDistance<=80){
-    _messageUserUnpinned=false;
-    _scrollPinned=true;
-    _nearBottomCount=2;
-  }else{
+  if(bottomDistance>80){
     _messageUserUnpinned=true;
     _scrollPinned=false;
     _nearBottomCount=0;
@@ -17057,9 +17045,9 @@ function _parseProcessWakeupBody(text){
   // watch suppression note is intentionally NOT split out of the output — real
   // process output can contain the identical text, so stripping it would drop
   // legitimate content (#6350 review finding 2). It rides along in `output`.
-  let m=s.match(/^\[IMPORTANT: Background process ([^\n]*?) completed \(exit_code=([^)\n]*)\)\.\nCommand: ([^\n]*)\nOutput:\n([\s\S]*)\]$/);
+  let m=s.match(/^\[IMPORTANT: Background process ([^\x0a]*?) completed \(exit_code=([^)\x0a]*)\)\.\x0aCommand: ([^\x0a]*)\x0aOutput:\x0a([\s\S]*)\]$/);
   if(m) return {type:'completion',taskId:m[1],exitCode:m[2],command:m[3],output:m[4],pattern:null};
-  m=s.match(/^\[IMPORTANT: Background process ([^\n]*?) matched watch pattern "(.*)"\.\nCommand: ([^\n]*)\nMatched output:\n([\s\S]*)\]$/);
+  m=s.match(/^\[IMPORTANT: Background process ([^\x0a]*?) matched watch pattern "(.*)"\.\x0aCommand: ([^\x0a]*)\x0aMatched output:\x0a([\s\S]*)\]$/);
   if(m) return {type:'watch_match',taskId:m[1],pattern:m[2],command:m[3],output:m[4],exitCode:null};
   return null;
 }
@@ -17128,6 +17116,115 @@ function _insertSegmentBlock(seg, html){
   }
   seg.insertAdjacentHTML('beforeend', html);
 }
+// 会话内的节点身份映射；不复制会话/运行状态，不把内容或数组下标当身份。
+let _messageDomOwner='';
+let _messageDomSequence=0;
+let _messageDomIds=new WeakMap();
+let _messageDomAliases=new Map();
+function _messageDomKeys(messages){
+  const owner=JSON.stringify([S.activeProfile||'',S.session?.session_id||'']);
+  if(owner!==_messageDomOwner){
+    _messageDomOwner=owner;
+    _messageDomIds=new WeakMap();
+    _messageDomAliases=new Map();
+  }
+  const counts=new Map();
+  const aliasOf=m=>m&&(m._ts??m.timestamp)!=null?JSON.stringify([m.role,m._ts??m.timestamp]):null;
+  for(const m of messages){
+    const alias=aliasOf(m);
+    if(alias) counts.set(alias,(counts.get(alias)||0)+1);
+  }
+  const nextAliases=new Map();
+  const keys=new Map();
+  for(const m of messages){
+    if(!m||typeof m!=='object') continue;
+    const explicit=m.message_id??m.id??m.local_id;
+    const alias=aliasOf(m);
+    let key=explicit!=null?JSON.stringify([owner,m.role,'message',explicit]):_messageDomIds.get(m);
+    // 无 ID 旧记录只在时间戳唯一时复用刷新前的身份；有歧义时不猜测。
+    if(!key&&alias&&counts.get(alias)===1) key=_messageDomAliases.get(alias);
+    if(!key) key=JSON.stringify([owner,m.role,'legacy',++_messageDomSequence]);
+    _messageDomIds.set(m,key);
+    if(alias&&counts.get(alias)===1) nextAliases.set(alias,key);
+    keys.set(m,key);
+  }
+  _messageDomAliases=nextAliases;
+  return keys;
+}
+function _destroyMessageNode(node){
+  if(node.nodeType===1) window.HermesMarkdown?.destroyWithin(node);
+  node.remove();
+}
+function _patchMessageShell(current,next){
+  if(current===next) return current;
+  if(current.nodeType!==next.nodeType||current.nodeName!==next.nodeName){
+    if(current.nodeType===1) window.HermesMarkdown?.destroyWithin(current);
+    current.replaceWith(next);
+    return next;
+  }
+  if(current.nodeType===3){
+    if(current.nodeValue!==next.nodeValue) current.nodeValue=next.nodeValue;
+    return current;
+  }
+  if(current.nodeType!==1) return current;
+  // 正文是组件的所有权边界：原生补丁不能进入其子树。
+  if(next.classList.contains('msg-body')&&next._markdownOwned) return current;
+  if(window.HermesMarkdown?.owns(current)) window.HermesMarkdown.destroyWithin(current);
+  for(const attr of Array.from(current.attributes)){
+    if(attr.name==='open') continue;
+    if(!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+  }
+  for(const attr of Array.from(next.attributes)){
+    if(attr.name==='open'&&current.tagName==='DETAILS') continue;
+    if(current.getAttribute(attr.name)!==attr.value) current.setAttribute(attr.name,attr.value);
+  }
+  const old=Array.from(current.childNodes);
+  let cursor=current.firstChild;
+  for(const child of Array.from(next.childNodes)){
+    const cls=child.nodeType===1?child.className:null;
+    const match=old.find(n=>n.nodeName===child.nodeName&&(n.nodeType!==1||
+      (child.classList.contains('msg-body')?n.classList.contains('msg-body'):n.className===cls)));
+    const actual=match?_patchMessageShell(match,child):child;
+    if(match) old.splice(old.indexOf(match),1);
+    if(actual!==cursor) current.insertBefore(actual,cursor);
+    cursor=actual.nextSibling;
+  }
+  for(const child of old) _destroyMessageNode(child);
+  return current;
+}
+function _messageNodeReconciler(parent){
+  const old=new Set(parent.children);
+  const keyed=new Map(Array.from(old).filter(n=>n.dataset.messageRenderKey).map(n=>[n.dataset.messageRenderKey,n]));
+  let cursor=parent.firstChild;
+  return {
+    get(key){return keyed.get(key);},
+    place(node,key,patch=true){
+      const existing=key&&keyed.get(key);
+      if(existing&&existing!==node&&patch) node=_patchMessageShell(existing,node);
+      if(key) node.dataset.messageRenderKey=key;
+      old.delete(node);
+      if(cursor&&cursor.parentNode!==parent) cursor=null;
+      if(node!==cursor) parent.insertBefore(node,cursor);
+      cursor=node.nextSibling;
+      return node;
+    },
+    finish(keep){
+      for(const node of old) if(!keep||!keep(node)) _destroyMessageNode(node);
+    },
+  };
+}
+function _mountMessageBody(row,content,key,message){
+  const body=row.querySelector('.msg-body');
+  if(!body) return;
+  const snapshots=message?._media_snapshots||message?.media_snapshots;
+  const signature=JSON.stringify([content,message?._live===true,snapshots||null]);
+  if(body._markdownSignature===signature&&window.HermesMarkdown?.owns(body)) return;
+  body._markdownSignature=signature;
+  mountHermesMarkdown(body,content,{
+    key:body.dataset.hermesMarkdownHost||key,
+    final:message?._live!==true,snapshots,
+  });
+}
 function renderMessages(options){
   _lastMessageRenderAt=performance.now();
   const preserveScroll=!!(options&&options.preserveScroll);
@@ -17148,11 +17245,6 @@ function renderMessages(options){
   // renderMessages() in this window. Keep the existing loading placeholder.
   if(_loadingSessionId===sid&&msgCount===0&&inner) return;
   if(sid!==_messageRenderWindowSid) _resetMessageRenderWindow(sid);
-  let cachedRenderSignature=null;
-  const hasTransientTranscriptUi=!!(
-    (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
-    (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
-  );
 
   const preservedCompressionTaskMessages=_latestPreservedCompressionTaskListMessages(S.messages);
   const visWithIdx=_getVisibleMessagesWithIdx();
@@ -17175,35 +17267,8 @@ function renderMessages(options){
   ];
   const headRenderCount=renderHeadVisWithIdx.length;
 
-  // Fast path: switching back to a previously rendered session with same count.
-  // Guard: sid !== _sessionHtmlCacheSid ensures in-session updates (edits,
-  // new messages, tool_complete) always get a fresh rebuild.
-  // Skip cache if this session is still streaming — the live smd parser writes
-  // into a DOM node inside the cached subtree; serving cached HTML detaches it.
-  // Also skip cache for transient transcript cards such as /compress and
-  // cross-channel handoff summaries; otherwise the cached transcript returns
-  // before those cards can be inserted.
-  if(sid&&sid!==_sessionHtmlCacheSid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi){
-    const renderSignature=_messageRenderCacheSignature();
-    cachedRenderSignature=renderSignature;
-    const cached=_sessionHtmlCache.get(sid);
-    if(cached&&cached.msgCount===msgCount&&cached.renderWindowKey===renderWindowKey&&cached.signature===renderSignature){
-      inner.innerHTML=cached.html;
-      _messageVirtualWindowKey=renderWindowKey;
-      _sessionHtmlCacheSid=sid;
-      _rehydrateTransparentStreamDom(inner);
-      _rehydrateDeferredWorklogsFromCache(inner);
-      _wireMessageWindowLoadEarlierButton();
-      if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
-      _scrollAfterMessageRender(preserveScroll, scrollSnapshot);
-      if(_maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualWindow)) return;
-      _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
-      requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
-      if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
-      if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
-      return;
-    }
-  }
+  // 组件实例不能序列化为 HTML 缓存；同会话依靠稳定节点复用。
+  _messageVirtualWindowKey=renderWindowKey;
   // Mid-stream flicker fix (#3877): when a renderMessages() rebuild is reached
   // while THIS session is actively streaming (e.g. the clarify-response echo at
   // messages.js, or a CLI-import refresh), the `inner.innerHTML=''` below detaches
@@ -17215,9 +17280,11 @@ function renderMessages(options){
   // connected and the streamed text visible. Only for the streaming session's own
   // live turn; never affects settled transcripts.
   let _preservedLiveTurn=null;
-  if(sid&&INFLIGHT[sid]){
+  if(sid&&(S.activeStreamId||INFLIGHT[sid])){
     const _lt=document.getElementById('liveAssistantTurn');
-    if(_lt&&(!_lt.dataset||!_lt.dataset.sessionId||_lt.dataset.sessionId===sid)){
+    const liveStream=_lt?.dataset.anchorStreamId||_lt?.dataset.liveStreamId;
+    const ownsStream=!S.activeStreamId||liveStream===S.activeStreamId;
+    if(_lt&&_lt.dataset.sessionId===sid&&ownsStream){
       // Live-turn preservation requires a PROVABLE live owner — never bare DOM
       // content. (#6948) The live turn is preserved across the wipe only while
       // (a) the stream is genuinely active (S.activeStreamId — the #3877
@@ -17266,15 +17333,18 @@ function renderMessages(options){
     S.session && typeof S.session.compression_anchor_summary==='string'
   ) ? S.session.compression_anchor_summary.trim() : '';
   const worklogDetailDisclosureState=_captureWorklogDetailDisclosureState(inner);
-  _recycleStash.clear();
-  if(_msgNodeRecycleEnabled){
-    for(const child of Array.from(inner.children)){
-      const key=child.dataset&&(child.dataset.recycleKey||child.dataset.msgIdx);
-      if(!key) continue;
-      if(child.id==='liveAssistantTurn'||child.querySelector&&child.querySelector('#liveAssistantTurn')) continue;
-      _recycleStash.set(Number(key), child);
-    }
+  const messageDomKeys=_messageDomKeys(S.messages);
+  if(inner.dataset.messageDomOwner!==_messageDomOwner){
+    window.HermesMarkdown?.destroyWithin(inner);
+    inner.replaceChildren();
+    inner.dataset.messageDomOwner=_messageDomOwner;
+    _preservedLiveTurn=null;
   }
+  const rowsReconciler=_messageNodeReconciler(inner);
+  const blockReconcilers=new Map();
+  const placeRow=(node,key)=>rowsReconciler.place(node,key);
+  const placeSegment=(turn,node,key,patch=true)=>blockReconcilers.get(_assistantTurnBlocks(turn)).place(node,key,patch);
+  _recycleStash.clear();
   // Mobile scroll-jank fix: temporarily disable overflow-anchor so Chromium
   // cannot re-anchor to the topmost row during the DOM wipe-and-rebuild gap.
   if(window._fixMobileScrollJank) window._fixMobileScrollJank();
@@ -17308,7 +17378,6 @@ function renderMessages(options){
   // the live reply stops following / appears to jump backward.
   _programmaticScroll=true;
   _programmaticScrollSetAt=performance.now();
-  inner.innerHTML='';
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
     S.messages,
@@ -17392,7 +17461,7 @@ function renderMessages(options){
   const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   if(virtualWindow.virtualized&&virtualWindow.topPad>0){
-    inner.appendChild(_messageVirtualSpacer(virtualWindow.topPad,'before'));
+    placeRow(_messageVirtualSpacer(virtualWindow.topPad,'before'),'spacer:before');
   }
   if(hasServerOlder){
     const indicator=document.createElement('button');
@@ -17402,7 +17471,7 @@ function renderMessages(options){
     indicator.textContent=serverOlderCount>0
       ? `Load earlier messages (${serverOlderCount} older)`
       : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
-    inner.appendChild(indicator);
+    placeRow(indicator,'load-earlier');
     _wireMessageWindowLoadEarlierButton();
     // Keep the settled compacted-context card immediately visible in a long,
     // tail-loaded conversation. Put it in flow (not inside an old tool turn).
@@ -17561,9 +17630,10 @@ function renderMessages(options){
       // turn before rendering the always-visible tail so assistant segments do
       // not merge across the spacer boundary.
       currentAssistantTurn=null;
-      inner.appendChild(_messageVirtualSpacer(virtualWindow.bottomPad,'after'));
+      placeRow(_messageVirtualSpacer(virtualWindow.bottomPad,'after'),'spacer:after');
     }
     const {m,rawIdx}=renderVisWithIdx[vi];
+    const messageKey=messageDomKeys.get(m);
     const _tsSep=m._ts||m.timestamp;
     if(_tsSep){
       const _d=new Date(_tsSep*1000);
@@ -17572,7 +17642,7 @@ function renderMessages(options){
         const sep=document.createElement('div');
         sep.className='msg-date-sep';
         sep.textContent=_fmtDateSep(_d);
-        inner.appendChild(sep);
+        placeRow(sep,'date:'+_key);
       }
       _prevSepKey=_key;
     }
@@ -17656,23 +17726,22 @@ function renderMessages(options){
         return _renderAttachmentHtml(fname,fileUrl);
       }).join('')}</div>`;
     }
-    let bodyHtml = _getCachedRender(displayContent, isUser);
+    const markdownEnabled=!isUser||window._renderUserMarkdown;
+    let bodyHtml=markdownEnabled?esc(String(displayContent||'')):_renderUserFencedBlocks(displayContent);
+    let bodyExtrasHtml='';
     // Message-level media snapshots: settled assistant messages carry a
     // path→digest map (written at settle time) freezing the file bytes the
     // turn emitted. Stamp it AFTER the text-keyed render cache so identical
     // text with different snapshots (old/new comparison) never collides.
-    if(!isUser && m && m._media_snapshots && typeof m._media_snapshots==='object'){
-      bodyHtml = _stampMediaSnapshots(bodyHtml, m._media_snapshots);
-    }
     if(!isUser&&m.provider_details){
       const summary=m.provider_details_label||'Provider details';
-      bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
+      bodyExtrasHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
     const recoveryPayload=(!isUser&&m._compressionRecovery)
       ? m._compressionRecovery
       : (!isUser&&isLastAssistant&&isTurnFinalAssistant&&typeof _activeCompressionRecoveryPayload==='function' ? _activeCompressionRecoveryPayload() : null);
     const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
-    if(recoveryHtml) bodyHtml += recoveryHtml;
+    if(recoveryHtml) bodyExtrasHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
@@ -17769,7 +17838,7 @@ function renderMessages(options){
         row._wakeupRenderedHtml=nextRowHtml;
         row.innerHTML=nextRowHtml;
       }
-      inner.appendChild(row);
+      row=placeRow(row,messageKey);
       userRows.set(rawIdx, row);
       continue;
     }
@@ -17779,7 +17848,7 @@ function renderMessages(options){
       let row=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
       if(row&&(!row.classList.contains('msg-row')||row.classList.contains('assistant-turn'))) row=null;
       const newRawText=String(displayContent).trim();
-      const nextRowHtml=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
+      const nextRowHtml=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${bodyExtrasHtml}${footHtml}`;
       if(row){
         row.className='msg-row';
         row.id=_userMessageDomId(rawIdx);
@@ -17811,31 +17880,31 @@ function renderMessages(options){
       // typeof guard keeps renderMessages runnable in the node test harnesses that
       // extract it without this helper (they stub every collaborator by name).
       if(typeof _applyUserRowIntrinsicHeight==='function') _applyUserRowIntrinsicHeight(row, newRawText);
-      inner.appendChild(row);
+      row.querySelector('.msg-body')._markdownOwned=!!markdownEnabled;
+      row=placeRow(row,messageKey);
+      if(markdownEnabled) _mountMessageBody(row,displayContent,messageKey,m);
       userRows.set(rawIdx, row);
       continue;
     }
 
     if(!currentAssistantTurn){
-      let recycled=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
-      if(recycled&&!recycled.classList.contains('assistant-turn')) recycled=null;
-      if(recycled){
-        const blocks=_assistantTurnBlocks(recycled);
-        if(blocks) blocks.innerHTML='';
-        for(const attr of _recycleResetAttrs) recycled.removeAttribute(attr);
-        const role=recycled.querySelector('.msg-role.assistant');
-        if(role) role.outerHTML=_assistantRoleHtml(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
-        currentAssistantTurn=recycled;
-      }else{
-        currentAssistantTurn=_createAssistantTurn(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
-      }
+      const questionIdx=questionRawIdxByAssistantRawIdx.get(rawIdx);
+      const questionKey=messageDomKeys.get(S.messages[questionIdx]);
+      const turnKey=JSON.stringify(['turn',questionKey||messageKey,vi>=headRenderCount?'tail':'head']);
+      currentAssistantTurn=rowsReconciler.get(turnKey);
+      if(!currentAssistantTurn&&m._live&&_preservedLiveTurn) currentAssistantTurn=_preservedLiveTurn;
+      if(!currentAssistantTurn) currentAssistantTurn=_createAssistantTurn(tsTitle, isTpsDisplayEnabled()?_formatTurnTps(m._turnTps):'');
+      currentAssistantTurn.dataset.messageRenderKey=turnKey;
+      if(!m._live) currentAssistantTurn.removeAttribute('id');
+      const blocks=_assistantTurnBlocks(currentAssistantTurn);
+      blockReconcilers.set(blocks,_messageNodeReconciler(blocks));
       currentAssistantTurn.dataset.role='assistant';
       if(S.session) currentAssistantTurn.dataset.sessionId=S.session.session_id;
       currentAssistantTurn.dataset.recycleKey=rawIdx;
-      inner.appendChild(currentAssistantTurn);
+      rowsReconciler.place(currentAssistantTurn,currentAssistantTurn.dataset.messageRenderKey,false);
     }
     _setLatestAssistantTurnLandmark(currentAssistantTurn, !m._live&&rawIdx===latestRenderedAssistantRawIdx);
-    const seg=document.createElement('div');
+    let seg=document.createElement('div');
     if(Array.isArray(orderedTransparentParts)&&orderedTransparentParts.length){
       const blocks=_assistantTurnBlocks(currentAssistantTurn);
       const sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
@@ -17866,11 +17935,11 @@ function renderMessages(options){
             segmentSeq:toolCall&&toolCall.activitySegmentSeq,
             burstId:(toolCall&&toolCall.activityBurstId)||m._activityBurstId,
           });
-          blocks.appendChild(toolRow);
+          placeSegment(currentAssistantTurn,toolRow,null,false);
           if(part.toolUseId) transparentOrderedToolIds.add(part.toolUseId);
           return;
         }
-        const orderedSeg=document.createElement('div');
+        let orderedSeg=document.createElement('div');
         const partDisplayText=_transparentOrderedDisplayText(part.text);
         if(!String(partDisplayText).trim()) return;
         orderedSeg.className='assistant-segment';
@@ -17883,7 +17952,7 @@ function renderMessages(options){
         if(_ERR_MSG_RE.test(String(partDisplayText||'').trim())) orderedSeg.dataset.error='1';
         if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))) orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
         const isLastTextPart=partIdx===lastTextPartIdx;
-        const partBodyHtml=_getCachedRender(partDisplayText,false);
+        const partBodyHtml=esc(String(partDisplayText||''));
         // Message-level media snapshots: transparent ordered segments carry the
         // same per-message path→digest map as the main transcript; stamp it so
         // historical previews freeze (&snap=) instead of following overwrites.
@@ -17892,8 +17961,12 @@ function renderMessages(options){
         if(isLastTextPart&&statusHtml){
           orderedSeg.insertAdjacentHTML('beforeend', statusHtml);
         }
-        _insertSegmentBlock(orderedSeg, `${isLastTextPart?filesHtml:''}<div class="msg-body">${(typeof m!=='undefined'&&m&&m._media_snapshots&&typeof m._media_snapshots==='object')?_stampMediaSnapshots(partBodyHtml,m._media_snapshots):partBodyHtml}</div>${isLastTextPart?footHtml:''}`);
-        blocks.appendChild(orderedSeg);
+        _insertSegmentBlock(orderedSeg, `${isLastTextPart?filesHtml:''}<div class="msg-body">${partBodyHtml}</div>${isLastTextPart?bodyExtrasHtml+footHtml:''}`);
+        const precedingTool=orderedTransparentParts.slice(0,partIdx).filter(p=>p?.kind==='tool').at(-1);
+        const partKey=JSON.stringify([messageKey,'prose',part.id||part.eventId||precedingTool?.toolUseId||'initial']);
+        orderedSeg.querySelector('.msg-body')._markdownOwned=true;
+        orderedSeg=placeSegment(currentAssistantTurn,orderedSeg,partKey);
+        _mountMessageBody(orderedSeg,partDisplayText,partKey,m);
         if(!firstSeg) firstSeg=orderedSeg;
       });
       assistantSegments.set(rawIdx, firstSeg||null);
@@ -17952,15 +18025,30 @@ function renderMessages(options){
     const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);
     if(statusHtml){
       seg.insertAdjacentHTML('beforeend', statusHtml);
-      if(hasVisibleBody) _insertSegmentBlock(seg, `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
+      if(hasVisibleBody) _insertSegmentBlock(seg, `${filesHtml}<div class="msg-body">${bodyHtml}</div>${bodyExtrasHtml}${footHtml}`);
     }else if(hasVisibleBody){
-      _insertSegmentBlock(seg, `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
+      _insertSegmentBlock(seg, `${filesHtml}<div class="msg-body">${bodyHtml}</div>${bodyExtrasHtml}${footHtml}`);
     }else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){
       seg.classList.add('assistant-segment-anchor');
     }
-    _assistantTurnBlocks(currentAssistantTurn).appendChild(seg);
+    const nextBody=seg.querySelector('.msg-body');
+    if(nextBody) nextBody._markdownOwned=true;
+    const blocks=_assistantTurnBlocks(currentAssistantTurn);
+    const liveSeq=seg.getAttribute('data-live-segment-seq');
+    const liveNode=m._live&&Array.from(blocks.children).find(n=>n.getAttribute('data-live-assistant')==='1'&&n.getAttribute('data-live-segment-seq')===liveSeq);
+    if(liveNode&&_liveAssistantSegmentTextLength(liveNode)>=String(displayContent||'').length){
+      seg=placeSegment(currentAssistantTurn,liveNode,messageKey,false);
+    }else{
+      seg=placeSegment(currentAssistantTurn,seg,messageKey);
+      if(nextBody) _mountMessageBody(seg,_stripXmlToolCallsDisplay(String(displayContent||'')),messageKey,m);
+    }
     assistantSegments.set(rawIdx, seg);
   }
+  for(const [blocks,reconciler] of blockReconcilers){
+    const live=!!_preservedLiveTurn&&blocks.closest('#liveAssistantTurn')===_preservedLiveTurn;
+    reconciler.finish(node=>live&&(node.hasAttribute('data-live-assistant')||!node.classList.contains('assistant-segment')));
+  }
+  rowsReconciler.finish(node=>node===_preservedLiveTurn);
 
   function _insertCompressionLikeNode(node, anchorIndex){
     if(!node) return false;
@@ -18767,7 +18855,7 @@ function renderMessages(options){
   // those segments. Fall back to whole-turn replace only when the rebuilt turn has
   // no live segment to swap into. No-op for a settled turn or when nothing was
   // streaming.
-  if(_preservedLiveTurn){
+  if(_preservedLiveTurn&&_preservedLiveTurn!==document.getElementById('liveAssistantTurn')){
     const _rebuilt=document.getElementById('liveAssistantTurn');
     // Pick the PARSER-OWNED live segment, not just the first one. On reconnect /
     // post-tool activity boundaries a live turn can carry MULTIPLE
@@ -18859,25 +18947,6 @@ function renderMessages(options){
   }
   // Apply persisted playback speed after media nodes are rendered.
   if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(inner);
-  // Populate session cache so switching back here skips a full rebuild.
-  _sessionHtmlCacheSid=sid;
-  // Skip caching while the just-settled keep-open token is armed: that render
-  // force-opens the settled worklog for height-stability, and caching it would
-  // persist the forced-open DOM across session switches / restores, overriding a
-  // user-collapsed worklog. The follow-up collapse pass (after disarm) produces
-  // the correct cacheable DOM on its own render. (#5260 gate-cert.) The typeof
-  // guard keeps standalone renderMessages() test harnesses (which don't define
-  // the helper) working — absent helper == not armed == cache normally.
-  const _keepOpenArmed=(typeof _isKeepSettledWorklogOpenArmed==='function')&&_isKeepSettledWorklogOpenArmed();
-  if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_keepOpenArmed){
-    const _html=inner.innerHTML;
-    // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
-    if(_html.length<300_000){
-      const renderSignature=cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature;
-      _sessionHtmlCache.set(sid,{html:_html,msgCount,renderWindowKey,signature:renderSignature});
-      if(_sessionHtmlCache.size>8){_sessionHtmlCache.delete(_sessionHtmlCache.keys().next().value);}
-    }
-  }
   _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, virtualWindow);
   // Kill the pinned/tail-follower mid-stream jitter. Schedule the re-anchor in a MICROTASK,
   // not synchronously: inside this render sync stack the browser still reports a transient
@@ -18891,7 +18960,10 @@ function renderMessages(options){
   // (typeof guards mirror the _deferClearProgrammaticScroll call below so standalone
   // renderMessages() test harnesses that don't define these helpers still run.)
   if(typeof queueMicrotask==='function' && typeof _reanchorPinnedTailAfterRender==='function'){
-    queueMicrotask(()=>_reanchorPinnedTailAfterRender(_preWipeNearTail));
+    const owner=JSON.stringify([S.activeProfile,sid,_messageScrollInputGeneration]);
+    queueMicrotask(()=>{
+      if(owner===JSON.stringify([S.activeProfile,S.session?.session_id,_messageScrollInputGeneration])) _reanchorPinnedTailAfterRender(_preWipeNearTail);
+    });
   }
   _recycleStash.clear();
   if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll(160);
@@ -20126,6 +20198,7 @@ function highlightCode(container) {
   if(blocks.length === 0) return;
   for(let i = 0; i < blocks.length; i++){
     const block = blocks[i];
+    if(window.HermesMarkdown?.owns(block))continue;
     if(typeof Prism.highlightElement === 'function') Prism.highlightElement(block);
     block.dataset.highlighted = '1';
   }
@@ -20304,6 +20377,7 @@ function addCopyButtons(container){
   const el=container||$('msgInner');
   if(!el) return;
   el.querySelectorAll('pre > code').forEach(codeEl=>{
+    if(window.HermesMarkdown?.owns(codeEl))return;
     const pre=codeEl.parentElement;
     const header=pre.previousElementSibling;
     if(pre.querySelector('.code-copy-btn')||(header&&header.classList.contains('pre-header')&&header.querySelector('.code-copy-btn'))) return;
@@ -20388,7 +20462,7 @@ function _csvMediaUrl(path, opts={}){
 function buildCsvTablePreview(path, text, downloadUrl=''){
   if(typeof text!=='string') return {errorKey:'csv_error'};
   if(text.length>CSV_MAX_SIZE) return {errorKey:'csv_too_large'};
-  const rows=text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').filter(r=>r.trim());
+  const rows=text.replace(/\r\x0a/g,'\x0a').replace(/\r/g,'\x0a').split('\x0a').filter(r=>r.trim());
   if(rows.length<2) return {errorKey:'csv_no_data'};
   // Auto-detect separator (comma, semicolon, tab)
   // Heuristic: uses the first separator found in the header row. Edge case:
@@ -20784,6 +20858,7 @@ function renderKatexBlocks(container,options){
     return;
   }
   blocks.forEach(el=>{
+    if(window.HermesMarkdown?.owns(el))return;
     if(streaming&&_isStreamingEquationPending(el,root)) return;
     el.dataset.rendered='true';
     const src=el.textContent||'';

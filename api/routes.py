@@ -13804,9 +13804,11 @@ def handle_get(handler, parsed) -> bool:
             # The disk read + process-constant token substitutions are cached;
             # only the per-session CSRF token and per-request extension tags are
             # applied here (see _render_index_shell_base).
+            from api.helpers import _markdown_iframe_origins
+
             html = _render_index_shell_base().replace(
                 "__CSRF_TOKEN_JSON__", json.dumps(csrf_token)
-            )
+            ).replace("__MARKDOWN_IFRAME_ORIGINS_JSON__", json.dumps(_markdown_iframe_origins()))
             return t(
                 handler,
                 inject_extension_tags(html),

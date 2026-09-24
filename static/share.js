@@ -1,3 +1,5 @@
+const $=id=>document.getElementById(id);
+
 function _shareTokenFromPath(){
   const path=window.location.pathname||'';
   const m=path.match(/\/share\/([^/?#]+)/);
@@ -22,24 +24,26 @@ function _shareRoleLabel(role){
 function _shareRenderMessages(messages){
   const wrap=$('shareTranscript');
   if(!wrap) return;
+  window.HermesMarkdown?.destroyWithin(wrap);
   if(!Array.isArray(messages)||!messages.length){
     wrap.innerHTML='<div class="share-empty">This shared conversation has no visible messages.</div>';
     return;
   }
   wrap.innerHTML='';
-  messages.forEach(msg=>{
+  messages.forEach((msg,index)=>{
     const row=document.createElement('article');
     row.className='share-message';
     row.dataset.role=String(msg.role||'assistant');
-    const bodyHtml=(typeof renderMd==='function')
-      ? renderMd(String(msg.content||''))
-      : `<p>${_shareEscapeHtml(msg.content||'')}</p>`;
     row.innerHTML=
       `<div class="share-role"><span class="share-role-badge">${_shareEscapeHtml(_shareRoleLabel(msg.role))}</span></div>`+
-      `<div class="msg-body share-message-body">${bodyHtml}</div>`;
+      '<div class="msg-body share-message-body"></div>';
     wrap.appendChild(row);
+    const body=row.querySelector('.msg-body');
+    const content=String(msg.content||'');
+    if(window.HermesMarkdown){
+      window.HermesMarkdown.mount(body,{key:'share:'+index,content,final:true,context:{surface:'share'}});
+    }else{body.textContent=content;}
   });
-  if(typeof highlightCode==='function') highlightCode(wrap);
 }
 
 function _shareSetError(message){
@@ -48,6 +52,7 @@ function _shareSetError(message){
   const wrap=$('shareTranscript');
   if(title) title.textContent='Share unavailable';
   if(meta) meta.textContent='This public snapshot could not be loaded.';
+  if(wrap) window.HermesMarkdown?.destroyWithin(wrap);
   if(wrap) wrap.innerHTML=`<div class="share-error"><strong>Could not open this share.</strong><div style="margin-top:8px">${_shareEscapeHtml(message||'The link may have expired or been revoked.')}</div></div>`;
 }
 
@@ -58,7 +63,7 @@ async function _shareLoad(){
     return;
   }
   try{
-    const data=await fetch(new URL(`/api/share/${encodeURIComponent(token)}`,window.location.origin).href,{credentials:'same-origin',cache:'no-store'});
+    const data=await fetch(new URL(`api/share/${encodeURIComponent(token)}`,document.baseURI).href,{credentials:'same-origin',cache:'no-store'});
     if(!data.ok){
       let message='The link may have expired or been revoked.';
       try{

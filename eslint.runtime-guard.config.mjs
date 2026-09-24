@@ -21,7 +21,7 @@
 
 export default [
   // Bundled/minified third-party assets are ES modules and not ours to lint.
-  { ignores: ["**/vendor/**", "**/*.min.js"] },
+  { ignores: ["**/vendor/**", "**/*.min.js", "static/renderer/**"] },
   {
     files: ["**/*.js"],
     languageOptions: { ecmaVersion: "latest", sourceType: "script" },
