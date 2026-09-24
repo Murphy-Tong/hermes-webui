@@ -36,8 +36,6 @@
 .hermes-markdown .hm-code { margin: .75em 0; border: 1px solid var(--border, #8884); border-radius: 8px; overflow: hidden; }
 .hermes-markdown .hm-code-header { display: flex; justify-content: space-between; align-items: center; padding: .35em .7em; background: var(--bg-secondary, #8881); }
 .hermes-markdown .hm-code pre { margin: 0; padding: .75em; }
-.hermes-markdown .hm-table-tools { display: flex; gap: .5rem; margin-block: .4rem; }
-.hermes-markdown .hm-table-tools input { min-width: 0; max-width: 100%; color: inherit; background: var(--bg-secondary, transparent); border: 1px solid var(--border, #8884); border-radius: 4px; }
 .hermes-markdown .hm-table-scroll { max-width: 100%; overflow: auto; }
 .hermes-markdown th button { background: none; border: 0; font-weight: inherit; }
 .hermes-markdown .hm-object-tree { padding: .75rem; max-height: 480px; overflow: auto; }

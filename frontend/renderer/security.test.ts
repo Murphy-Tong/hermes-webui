@@ -63,4 +63,33 @@ describe('结构 HTML', () => {
       .toEqual({ color: 'red', 'text-align': 'center' });
     expect(safeStyle('color:var(--secret);background-color:expression(alert(1))')).toEqual({});
   });
+  it('放行常用富文本视觉属性（黑名单模型）', () => {
+    const style = safeStyle('padding:8px;line-height:2;font-size:20px;letter-spacing:1px;opacity:0.5;'
+      + 'border:2px solid red;border-radius:6px;box-shadow:0 0 4px black;text-shadow:1px 1px 2px black;'
+      + 'transform:rotate(3deg);line-break:strict');
+    const keys = Object.keys(style);
+    // jsdom 保留 shorthand 原样 key，浏览器展开为 longhand；对应族有任意一项落地即视为放行。
+    for (const family of ['padding', 'line-height', 'font-size', 'letter-spacing', 'opacity',
+      'border', 'box-shadow', 'text-shadow', 'transform', 'line-break']) {
+      expect(keys.some(key => key.startsWith(family)), family).toBe(true);
+    }
+    expect(style['border-radius']).toBe('6px');
+  });
+  it('布局劫持与资源加载属性被拦，纯视觉属性放行', () => {
+    // position/inset/z-index/float/behavior 无论取值一律丢弃。
+    expect(safeStyle('position:fixed;inset:0;z-index:9999;float:left;behavior:url(#x);color:red')).toEqual({ color: 'red' });
+    // url() 在任意属性上都被值层拦截（含 filter/cursor/list-style-image 等未列举属性）。
+    expect(safeStyle('filter:url(#x);cursor:url(https://evil.test/c);list-style-image:url(https://evil.test/d);color:blue')).toEqual({ color: 'blue' });
+    // 纯视觉、旧白名单里没有的属性现在默认放行。
+    expect(safeStyle('width:100px;height:50px;transform-origin:center')['width']).toBe('100px');
+  });
+  it('放行渐变背景但拒绝 background url() 加载', () => {
+    // jsdom 保留 background shorthand，浏览器展开为 background-image；两者之一含渐变即视为放行。
+    const gradient = safeStyle('background:linear-gradient(45deg, red, blue)');
+    expect(gradient['background'] ?? gradient['background-image']).toContain('linear-gradient');
+    expect(safeStyle('background-image:radial-gradient(circle, white, black)')['background-image']).toContain('radial-gradient');
+    // 走 background-image 直接塞 url() 也必须在值层被丢弃。
+    expect(safeStyle('background-image:url(https://evil.test/x);color:green')).toEqual({ color: 'green' });
+  });
+
 });

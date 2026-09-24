@@ -169,29 +169,16 @@ const plainText = (node: unknown): string => {
 export const Table = defineComponent({
   props: { node: { type: Object as PropType<TableNode>, required: true } },
   setup(props) {
-    const filter = ref('');
     const sort = ref(-1);
     const direction = ref(1);
-    const copied = ref(false);
     const rows = computed(() => {
-      const query = filter.value.toLocaleLowerCase();
-      const rows = props.node.rows.map((row, key) => ({ row, key }))
-        .filter(({ row }) => !query || row.cells.some(cell => plainText(cell).toLocaleLowerCase().includes(query)));
+      const rows = props.node.rows.map((row, key) => ({ row, key }));
       if (sort.value >= 0) rows.sort((a, b) => direction.value *
         plainText(a.row.cells[sort.value]).localeCompare(plainText(b.row.cells[sort.value]), undefined, { numeric: true }));
       return rows;
     });
     const cell = (children: BaseNode[]) => h(MarkdownRender, { ...immediateProps, nodes: children, renderAsFragment: true });
     return () => h('div', { class: 'hm-table' }, [
-      h('div', { class: 'hm-table-tools' }, [
-        h('input', { type: 'search', value: filter.value, placeholder: '筛选表格', 'aria-label': '筛选表格',
-          onInput: (event: Event) => { filter.value = (event.target as HTMLInputElement).value; } }),
-        h('button', { type: 'button', onClick: async () => {
-          const text = [props.node.header, ...rows.value.map(item => item.row)]
-            .map(row => row.cells.map(plainText).join('\t')).join('\n');
-          try { await navigator.clipboard.writeText(text); copied.value = true; } catch { copied.value = false; }
-        } }, copied.value ? '已复制' : '复制表格'),
-      ]),
       h('div', { class: 'hm-table-scroll' }, [h('table', [
         h('thead', [h('tr', props.node.header.cells.map((column, index) => h('th', {
           key: index, style: { textAlign: column.align },

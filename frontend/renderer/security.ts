@@ -86,13 +86,30 @@ const tags = ['p','div','span','br','hr','strong','b','em','i','u','s','del','ma
 const attrs = ['href','src','alt','title','width','height','colspan','rowspan','scope','start','reversed',
   'value','open','style','align','poster','type','kind','srclang','label'];
 
+// CSS 采用「黑名单」而非「白名单」：不受信的 LLM 输出里绝大多数样式（padding、
+// 圆角、渐变、阴影、transform、字号…）都是纯视觉、零风险，逐个补白名单是无底洞。
+// 真正需要拦的只有两类，因此默认放行任意属性，只丢弃下面这两类：
+const BLOCKED_STYLE_PROPERTIES = new Set([
+  // ① 可劫持布局做透明全屏罩 / clickjacking，或历史执行向量的属性。
+  'position', 'top', 'right', 'bottom', 'left',
+  'inset', 'inset-block', 'inset-inline', 'inset-block-start', 'inset-block-end',
+  'inset-inline-start', 'inset-inline-end', 'z-index', 'float', 'clear',
+  'behavior', '-moz-binding', '-ms-behavior',
+]);
+// ② 值层统一拦截：任何能加载外部资源的 url()（SSRF/内网探测，覆盖 background-image、
+// border-image、filter、cursor、list-style 等所有属性）、脚本执行向量、at-rule、
+// CSS 变量间接引用与反斜杠绕过。
+const UNSAFE_STYLE_VALUE = /url\s*\(|expression\s*\(|javascript\s*:|vbscript\s*:|@|\\|var\s*\(/i;
+
 export function safeStyle(source: string): Record<string, string> {
   const style = document.createElement('span').style;
   const result: Record<string, string> = {};
   style.cssText = source;
-  for (const key of ['color', 'background-color', 'text-align', 'font-weight', 'font-style', 'text-decoration']) {
+  for (let index = 0; index < style.length; index++) {
+    const key = style.item(index);
+    if (!key || key.startsWith('--') || BLOCKED_STYLE_PROPERTIES.has(key.toLowerCase())) continue;
     const value = style.getPropertyValue(key);
-    if (value && !/url\s*\(|expression\s*\(|var\s*\(|@|\\/i.test(value)) result[key] = value;
+    if (value && !UNSAFE_STYLE_VALUE.test(value)) result[key] = value;
   }
   return result;
 }

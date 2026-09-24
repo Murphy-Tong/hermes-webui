@@ -102,11 +102,8 @@ describe('实际 Markstream 组件', () => {
     root.querySelector<HTMLButtonElement>('th:nth-child(2) button')!.click();
     await view.settled();
     expect(root.querySelector('tbody tr')?.textContent).toBe('a2');
-    const filter = root.querySelector<HTMLInputElement>('input[type="search"]')!;
-    filter.value = 'b'; filter.dispatchEvent(new Event('input'));
-    await view.settled();
-    expect(root.querySelectorAll('tbody tr').length).toBe(1);
-    expect(root.querySelector('tbody tr')?.textContent).toBe('b10');
+    expect(root.querySelector('input[type="search"]')).toBeNull();
+    expect(root.textContent).not.toContain('复制表格');
   });
   it('MEDIA 使用实例的媒体快照，代码里的协议保持字面内容', async () => {
     const context = { sessionId: 'a', snapshots: { '/tmp/image_1.png': 'b'.repeat(64) },
